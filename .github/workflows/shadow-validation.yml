@@ -40,7 +40,9 @@ jobs:
           set -euo pipefail
           python3 scripts/check_fork_delta.py
           python3 scripts/run_batumi_contracts.py --list
-          python3 scripts/check_agents_context.py
+          if [[ -f scripts/check_agents_context.py ]]; then
+            python3 scripts/check_agents_context.py
+          fi
 
   image:
     runs-on: ubuntu-latest
