@@ -11,6 +11,11 @@ on:
         description: Exact hermes-ops commit containing reviewed build tooling
         required: true
         type: string
+      deployment_lane:
+        description: Protected ref and required-check policy to enforce
+        required: false
+        default: live
+        type: string
     outputs:
       digest:
         description: Published immutable image digest
@@ -35,7 +40,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       EXPECTED_SHA: ${{ inputs.source_sha }}
-      REQUIRED_CONTEXT: All required checks pass
+      DEPLOYMENT_LANE: ${{ inputs.deployment_lane }}
     steps:
       - name: Validate exact pins
         env:
@@ -43,15 +48,18 @@ jobs:
         run: |
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$OPS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          python3 ops/scripts/deploy/select_deployment_policy.py \
+            --lane "$DEPLOYMENT_LANE" \
+            --github-env "$GITHUB_ENV"
       - name: Wait for aggregate CI on the exact source
         run: |
           set -euo pipefail
           for attempt in $(seq 1 100); do
             latest=$(gh api \
-              repos/batumilove/hermes-agent/branches/batumi%2Flive \
+              "repos/batumilove/hermes-agent/branches/${source_branch//\\//%2F}" \
               --jq '.commit.sha')
             test "$latest" = "$EXPECTED_SHA" || {
-              echo "Refusing stale deployment: branch=$latest workflow=$EXPECTED_SHA" >&2
+              echo "Refusing stale deployment: branch=$source_branch head=$latest workflow=$EXPECTED_SHA" >&2
               exit 1
             }
             result=$(gh api \
@@ -60,7 +68,7 @@ jobs:
           import json, os, sys
           runs = [
               run for run in json.load(sys.stdin).get("check_runs", [])
-              if run.get("name") == os.environ["REQUIRED_CONTEXT"]
+              if run.get("name") == os.environ["required_context"]
               and run.get("app", {}).get("id") == 15368
           ]
           runs.sort(key=lambda run: run.get("started_at") or "")
