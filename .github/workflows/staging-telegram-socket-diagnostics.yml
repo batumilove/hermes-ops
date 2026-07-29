@@ -17,6 +17,11 @@ on:
         required: false
         default: disabled
         type: string
+      deployment_lane:
+        description: Protected source branch allowed to run diagnostics
+        required: false
+        default: live
+        type: string
     secrets:
       TAILSCALE_AUTHKEY:
         required: false
@@ -43,7 +48,10 @@ jobs:
       vars.HERMES_STAGING_DIAGNOSTICS_ENABLED == 'true' &&
       inputs.activation_ack == 'enabled' &&
       github.repository == 'batumilove/hermes-agent' &&
-      github.ref == 'refs/heads/batumi/live' &&
+      (
+        (inputs.deployment_lane == 'live' && github.ref == 'refs/heads/batumi/live') ||
+        (inputs.deployment_lane == 'candidate' && github.ref == 'refs/heads/rebuild/batumi-live')
+      ) &&
       github.sha == inputs.expected_source_sha
     runs-on: ubuntu-latest
     timeout-minutes: 20
