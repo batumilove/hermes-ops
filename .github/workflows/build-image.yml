@@ -1,0 +1,179 @@
+name: Reusable immutable image build
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact caller commit to build
+        required: true
+        type: string
+      ops_sha:
+        description: Exact hermes-ops commit containing reviewed build tooling
+        required: true
+        type: string
+    outputs:
+      digest:
+        description: Published immutable image digest
+        value: ${{ jobs.publish-image.outputs.digest }}
+      source_sha:
+        description: Exact source SHA represented by the image
+        value: ${{ jobs.publish-image.outputs.source-sha }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPOSITORY: ghcr.io/batumilove/hermes-agent-deploy
+
+jobs:
+  wait-for-required-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      checks: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EXPECTED_SHA: ${{ inputs.source_sha }}
+      REQUIRED_CONTEXT: All required checks pass
+    steps:
+      - name: Validate exact pins
+        env:
+          OPS_SHA: ${{ inputs.ops_sha }}
+        run: |
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$OPS_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - name: Wait for aggregate CI on the exact source
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 100); do
+            latest=$(gh api \
+              repos/batumilove/hermes-agent/branches/batumi%2Flive \
+              --jq '.commit.sha')
+            test "$latest" = "$EXPECTED_SHA" || {
+              echo "Refusing stale deployment: branch=$latest workflow=$EXPECTED_SHA" >&2
+              exit 1
+            }
+            result=$(gh api \
+              "repos/batumilove/hermes-agent/commits/$EXPECTED_SHA/check-runs?filter=latest&per_page=100" \
+              | python3 -c '
+          import json, os, sys
+          runs = [
+              run for run in json.load(sys.stdin).get("check_runs", [])
+              if run.get("name") == os.environ["REQUIRED_CONTEXT"]
+              and run.get("app", {}).get("id") == 15368
+          ]
+          runs.sort(key=lambda run: run.get("started_at") or "")
+          run = runs[-1] if runs else {}
+          print(f"{run.get('"'"'status'"'"', '"'"'missing'"'"')}:{run.get('"'"'conclusion'"'"') or '"'"'pending'"'"'}")
+          ')
+            case "$result" in
+              completed:success) exit 0 ;;
+              completed:failure|completed:cancelled|completed:timed_out|completed:action_required)
+                exit 1
+                ;;
+            esac
+            echo "aggregate gate: $result (attempt $attempt)"
+            sleep 20
+          done
+          exit 1
+
+  publish-image:
+    needs: wait-for-required-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.resolve.outputs.digest || steps.build.outputs.digest }}
+      source-sha: ${{ inputs.source_sha }}
+    steps:
+      - name: Check out exact application source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          persist-credentials: false
+      - name: Check out exact operational tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: batumilove/hermes-ops
+          ref: ${{ inputs.ops_sha }}
+          path: ops
+          persist-credentials: false
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Resolve existing source-SHA image
+        id: resolve
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          python3 ops/scripts/deploy/resolve_ghcr_digest.py \
+            --repository "$IMAGE_REPOSITORY" \
+            --reference "sha-$SOURCE_SHA" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Verify reused image provenance
+        if: steps.resolve.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_DIGEST: ${{ steps.resolve.outputs.digest }}
+          EXPECTED_SHA: ${{ inputs.source_sha }}
+          EXPECTED_SOURCE_URI: git+${{ github.server_url }}/${{ github.repository }}@${{ github.ref }}
+        run: |
+          set -euo pipefail
+          evidence=$(mktemp)
+          trap 'rm -f "$evidence"' EXIT
+          gh attestation verify \
+            "oci://${IMAGE_REPOSITORY}@${EXPECTED_DIGEST}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --source-digest "$EXPECTED_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --signer-workflow "batumilove/hermes-ops/.github/workflows/build-image.yml" \
+            --deny-self-hosted-runners \
+            --format json > "$evidence"
+          python3 ops/scripts/deploy/verify_image_attestation.py \
+            --evidence "$evidence" \
+            --repository "$IMAGE_REPOSITORY" \
+            --digest "$EXPECTED_DIGEST" \
+            --source-sha "$EXPECTED_SHA" \
+            --source-uri "$EXPECTED_SOURCE_URI"
+      - name: Set up Docker Buildx
+        if: steps.resolve.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build and publish immutable image
+        id: build
+        if: steps.resolve.outputs.exists == 'false'
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: source
+          file: source/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_REPOSITORY }}:sha-${{ inputs.source_sha }}
+            ${{ env.IMAGE_REPOSITORY }}:candidate
+          labels: |
+            org.opencontainers.image.revision=${{ inputs.source_sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          build-args: |
+            HERMES_GIT_SHA=${{ inputs.source_sha }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=hermes-deploy-amd64
+          cache-to: type=gha,mode=max,scope=hermes-deploy-amd64
+      - name: Attest image provenance
+        if: steps.resolve.outputs.exists == 'false'
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ env.IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
