@@ -1,0 +1,37 @@
+name: hermes-${HERMES_DEPLOY_ENV:?set HERMES_DEPLOY_ENV}
+
+services:
+  gateway:
+    image: ${HERMES_IMAGE:?set HERMES_IMAGE to an immutable image digest}
+    container_name: hermes-${HERMES_DEPLOY_ENV}-gateway
+    restart: unless-stopped
+    network_mode: host
+    stop_grace_period: 90s
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      # s6-overlay copies and executes its init from /run/s6 during startup.
+      # Docker's default tmpfs options include noexec, so exec must be explicit.
+      - /run:rw,exec,nosuid,nodev,size=64m,mode=0755
+      - /tmp:rw,noexec,nosuid,nodev,size=1g,mode=1777
+    volumes:
+      - type: bind
+        source: ${HERMES_DATA_DIR:?set HERMES_DATA_DIR}
+        target: /opt/data
+    environment:
+      HERMES_UID: ${HERMES_UID:?set HERMES_UID}
+      HERMES_GID: ${HERMES_GID:?set HERMES_GID}
+      HERMES_DEPLOY_ENV: ${HERMES_DEPLOY_ENV}
+      HERMES_SOURCE_SHA: ${HERMES_SOURCE_SHA:?set HERMES_SOURCE_SHA}
+    command: ["gateway", "run"]
+    healthcheck:
+      test: ["CMD-SHELL", "/command/s6-svstat /run/service/main-hermes | grep -q '^up '"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

@@ -1,0 +1,26 @@
+[Unit]
+Description=Restore interrupted Hermes staging diagnostic transaction
+After=local-fs.target systemd-tmpfiles-setup.service docker.service
+RequiresMountsFor=/opt/hermes-compose/staging /home/hermes-staging/.hermes-staging /var/lib/hermes-staging-diagnostics
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/libexec/hermes-staging-diagnostic --recover
+TimeoutStartSec=270
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+# Recovery must atomically rename the transaction guard between DATA_ROOT
+# (/home) and TRANSACTION_ROOT (/var). ProtectSystem=strict with separate
+# ReadWritePaths bind mounts makes that rename fail with EXDEV. Keep executable
+# and configuration trees read-only without splitting the two state paths into
+# different mount points.
+ProtectSystem=full
+ProtectHome=false
+ReadOnlyPaths=/etc /opt/hermes-compose/staging
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes

@@ -1,0 +1,2 @@
+# Root-owned shared lock used by deployment, diagnostic runs, and recovery.
+f /run/lock/hermes-staging-diagnostic.lock 0660 root hermes-deploy -

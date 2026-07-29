@@ -1,0 +1,76 @@
+name: Reusable running-stack shadow
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact caller commit to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate source pin
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Check out exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify fork attribution and compatibility contracts
+        run: |
+          set -euo pipefail
+          python3 scripts/check_fork_delta.py
+          python3 scripts/run_batumi_contracts.py --list
+          python3 scripts/check_agents_context.py
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build deployed architecture
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: hermes-stack-shadow:${{ inputs.source_sha }}
+          build-args: |
+            HERMES_GIT_SHA=${{ inputs.source_sha }}
+      - name: Exercise runtime imports
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          docker run --rm --entrypoint python \
+            "hermes-stack-shadow:${SOURCE_SHA}" \
+            -c 'import cron.scheduler; import gateway.run; import tools.registry'
+
+  shadow:
+    needs: [policy, image]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all shadow lanes
+        env:
+          POLICY: ${{ needs.policy.result }}
+          IMAGE: ${{ needs.image.result }}
+        run: |
+          test "$POLICY" = success
+          test "$IMAGE" = success

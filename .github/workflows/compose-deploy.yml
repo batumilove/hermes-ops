@@ -1,0 +1,157 @@
+name: Reusable Compose deployment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment and Hermes deployment environment
+        required: true
+        type: string
+      operation:
+        description: deploy or rollback
+        required: true
+        type: string
+      image_digest:
+        description: Immutable sha256 image digest (required for deploy)
+        required: false
+        type: string
+      source_sha:
+        description: Full source commit SHA recorded in deployment evidence
+        required: true
+        type: string
+      ops_sha:
+        description: Exact hermes-ops commit containing reviewed deployment tooling
+        required: true
+        type: string
+    secrets:
+      TAILSCALE_AUTHKEY:
+        description: Scoped, reusable, ephemeral Tailscale auth key fallback
+        required: false
+      TAILSCALE_OAUTH_CLIENT_ID:
+        required: false
+      TAILSCALE_OAUTH_SECRET:
+        required: false
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_KNOWN_HOSTS:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: ${{ inputs.environment }}
+    env:
+      DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+      DEPLOY_OPERATION: ${{ inputs.operation }}
+      IMAGE_DIGEST: ${{ inputs.image_digest }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      OPS_SHA: ${{ inputs.ops_sha }}
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+      DEPLOY_ROOT: ${{ vars.DEPLOY_ROOT }}
+      TAILSCALE_TAGS: ${{ vars.TAILSCALE_TAGS }}
+      IMAGE_REPOSITORY: ghcr.io/batumilove/hermes-agent-deploy
+    steps:
+      - name: Validate deployment inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_ENVIRONMENT" =~ ^batumi-(staging|production)$ ]]
+          [[ "$DEPLOY_OPERATION" =~ ^(deploy|rollback)$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$OPS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$DEPLOY_ROOT" =~ ^/[A-Za-z0-9._/-]+$ && "$DEPLOY_ROOT" != / ]]
+          [[ "$TAILSCALE_TAGS" =~ ^tag:[A-Za-z0-9,_:-]+$ ]]
+          if [[ "$DEPLOY_OPERATION" == deploy ]]; then
+            [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          fi
+
+      - name: Check out deployment tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: batumilove/hermes-ops
+          ref: ${{ inputs.ops_sha }}
+          path: ops
+          persist-credentials: false
+
+      - name: Join the deployment tailnet
+        uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          tags: ${{ env.TAILSCALE_TAGS }}
+          hostname: gha-hermes-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Configure pinned SSH identity
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 0700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+
+      - name: Install deployment tooling and apply release
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${DEPLOY_USER}@${DEPLOY_HOST}"
+          incoming=".incoming-${SOURCE_SHA}-${GITHUB_RUN_ATTEMPT}"
+          ssh_opts=(
+            -i "$HOME/.ssh/deploy_key"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o ConnectTimeout=15
+          )
+
+          # shellcheck disable=SC2029
+          ssh "${ssh_opts[@]}" "$target" \
+            "install -d -m 0700 '$DEPLOY_ROOT/$incoming'"
+          cleanup() {
+            # shellcheck disable=SC2029
+            ssh "${ssh_opts[@]}" "$target" \
+              "rm -rf '$DEPLOY_ROOT/$incoming'" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          scp "${ssh_opts[@]}" \
+            ops/deploy/compose.yml \
+            ops/scripts/deploy/hermes-compose-deploy.sh \
+            ops/scripts/deploy/verify_running_stack.py \
+            "$target:$DEPLOY_ROOT/$incoming/"
+
+          ssh "${ssh_opts[@]}" "$target" bash -s -- \
+            "$DEPLOY_ROOT" "$incoming" "$DEPLOY_OPERATION" \
+            "$DEPLOY_ENVIRONMENT" "$IMAGE_REPOSITORY" \
+            "${IMAGE_DIGEST:--}" "$SOURCE_SHA" <<'REMOTE'
+          set -euo pipefail
+          deploy_root=$1
+          incoming=$2
+          operation=$3
+          environment=$4
+          image=$5
+          digest=$6
+          source_sha=$7
+
+          install -m 0644 "$deploy_root/$incoming/compose.yml" "$deploy_root/compose.yml"
+          install -m 0755 \
+            "$deploy_root/$incoming/hermes-compose-deploy.sh" \
+            "$deploy_root/hermes-compose-deploy.sh"
+          install -m 0755 \
+            "$deploy_root/$incoming/verify_running_stack.py" \
+            "$deploy_root/verify-running-stack.py"
+          exec "$deploy_root/hermes-compose-deploy.sh" \
+            "$operation" "$environment" "$image" "$digest" "$source_sha" "$deploy_root"
+          REMOTE

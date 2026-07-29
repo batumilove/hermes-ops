@@ -1,0 +1,129 @@
+name: Observe Telegram socket ownership on staging
+
+on:
+  workflow_call:
+    inputs:
+      expected_source_sha:
+        description: Exact source SHA currently deployed to batumi-staging
+        required: true
+        type: string
+      observation_seconds:
+        description: Bounded diagnostic observation window
+        required: false
+        default: "90"
+        type: string
+      activation_ack:
+        description: Explicit activation acknowledgement (must be enabled)
+        required: false
+        default: disabled
+        type: string
+    secrets:
+      TAILSCALE_AUTHKEY:
+        required: false
+      TAILSCALE_OAUTH_CLIENT_ID:
+        required: false
+      TAILSCALE_OAUTH_SECRET:
+        required: false
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_KNOWN_HOSTS:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-staging-socket-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    name: Enable, observe, and restore
+    if: >-
+      vars.HERMES_STAGING_DIAGNOSTICS_ENABLED == 'true' &&
+      inputs.activation_ack == 'enabled' &&
+      github.repository == 'batumilove/hermes-agent' &&
+      github.ref == 'refs/heads/batumi/live' &&
+      github.sha == inputs.expected_source_sha
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: batumi-staging
+    env:
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      OBSERVATION_SECONDS: ${{ inputs.observation_seconds }}
+      DEPLOY_HOST: hermes-staging-01
+      DEPLOY_USER: hermes-deploy
+      TAILSCALE_TAGS: ${{ vars.TAILSCALE_TAGS }}
+
+    steps:
+      - name: Validate fixed staging inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$OBSERVATION_SECONDS" =~ ^(60|90|120)$ ]]
+          [[ "$DEPLOY_HOST" == hermes-staging-01 ]]
+          [[ "$DEPLOY_USER" == hermes-deploy ]]
+          [[ "$TAILSCALE_TAGS" =~ ^tag:[A-Za-z0-9,_:-]+$ ]]
+
+      - name: Join the deployment tailnet
+        uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+          tags: ${{ env.TAILSCALE_TAGS }}
+          hostname: gha-hermes-staging-socket-diag-${{ github.run_id }}
+
+      - name: Configure pinned SSH identity
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 0700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+
+      - name: Run bounded diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          request_file=$(mktemp)
+          trap 'rm -f -- "$request_file"' EXIT
+          python3 -c '
+          import json, os, secrets
+          request = {
+              "expected_source_sha": os.environ["EXPECTED_SOURCE_SHA"],
+              "observation_seconds": int(os.environ["OBSERVATION_SECONDS"]),
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "nonce": secrets.token_urlsafe(24),
+          }
+          payload = json.dumps(request, separators=(",", ":"), sort_keys=True).encode()
+          if len(payload) > 4096:
+              raise SystemExit("request exceeds 4096 bytes")
+          os.write(1, payload)
+          ' >"$request_file"
+          target="${DEPLOY_USER}@${DEPLOY_HOST}"
+          ssh_opts=(
+            -F /dev/null
+            -i "$HOME/.ssh/deploy_key"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$HOME/.ssh/known_hosts"
+            -o GlobalKnownHostsFile=/dev/null
+            -o PasswordAuthentication=no
+            -o KbdInteractiveAuthentication=no
+            -o ChallengeResponseAuthentication=no
+            -o PreferredAuthentications=publickey
+            -o PubkeyAuthentication=yes
+            -o NumberOfPasswordPrompts=0
+            -o ConnectTimeout=15
+          )
+          ssh "${ssh_opts[@]}" "$target" 'sudo -n /usr/local/libexec/hermes-staging-diagnostic' <"$request_file"

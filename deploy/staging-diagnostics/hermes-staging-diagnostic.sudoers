@@ -1,0 +1,4 @@
+# Installed only by the explicit --authorize phase after digest verification.
+Cmnd_Alias HERMES_STAGING_DIAGNOSTIC = sha256:__HELPER_SHA256__ /usr/local/libexec/hermes-staging-diagnostic ""
+Defaults!HERMES_STAGING_DIAGNOSTIC env_reset,secure_path=/usr/sbin:/usr/bin:/sbin:/bin,!set_home
+hermes-deploy ALL=(root) NOPASSWD: HERMES_STAGING_DIAGNOSTIC
