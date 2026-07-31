@@ -12,8 +12,8 @@ on:
         required: true
         type: string
       image_digest:
-        description: Immutable sha256 image digest (required for deploy)
-        required: false
+        description: Exact immutable target sha256 image digest
+        required: true
         type: string
       source_sha:
         description: Full source commit SHA recorded in deployment evidence
@@ -53,7 +53,6 @@ jobs:
       OPS_SHA: ${{ inputs.ops_sha }}
       DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
       DEPLOY_USER: ${{ vars.DEPLOY_USER }}
-      DEPLOY_ROOT: ${{ vars.DEPLOY_ROOT }}
       TAILSCALE_TAGS: ${{ vars.TAILSCALE_TAGS }}
       IMAGE_REPOSITORY: ghcr.io/batumilove/hermes-agent-deploy
     steps:
@@ -67,19 +66,8 @@ jobs:
           [[ "$OPS_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
           [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
-          [[ "$DEPLOY_ROOT" =~ ^/[A-Za-z0-9._/-]+$ && "$DEPLOY_ROOT" != / ]]
           [[ "$TAILSCALE_TAGS" =~ ^tag:[A-Za-z0-9,_:-]+$ ]]
-          if [[ "$DEPLOY_OPERATION" == deploy ]]; then
-            [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          fi
-
-      - name: Check out deployment tooling
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: batumilove/hermes-ops
-          ref: ${{ inputs.ops_sha }}
-          path: ops
-          persist-credentials: false
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
 
       - name: Join the deployment tailnet
         uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3
@@ -102,12 +90,11 @@ jobs:
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 0600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
 
-      - name: Install deployment tooling and apply release
+      - name: Apply release through installed host controller
         shell: bash
         run: |
           set -euo pipefail
           target="${DEPLOY_USER}@${DEPLOY_HOST}"
-          incoming=".incoming-${SOURCE_SHA}-${GITHUB_RUN_ATTEMPT}"
           ssh_opts=(
             -i "$HOME/.ssh/deploy_key"
             -o BatchMode=yes
@@ -116,42 +103,16 @@ jobs:
             -o ConnectTimeout=15
           )
 
+          controller="github-actions:compose-deploy:${GITHUB_RUN_ID}"
+          actor=${GITHUB_ACTOR//[^A-Za-z0-9_.@-]/-}
+          authorization="github:${actor}"
+          remote_args=(
+            sudo -n /usr/local/libexec/hermes-deployment-controller apply
+            "$DEPLOY_ENVIRONMENT" "$DEPLOY_OPERATION" "$IMAGE_REPOSITORY"
+            "$IMAGE_DIGEST" "$SOURCE_SHA" "$controller" "$authorization"
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          )
+          printf -v remote_command '%q ' "${remote_args[@]}"
+          # remote_command is locally built with printf %q for remote parsing.
           # shellcheck disable=SC2029
-          ssh "${ssh_opts[@]}" "$target" \
-            "install -d -m 0700 '$DEPLOY_ROOT/$incoming'"
-          cleanup() {
-            # shellcheck disable=SC2029
-            ssh "${ssh_opts[@]}" "$target" \
-              "rm -rf '$DEPLOY_ROOT/$incoming'" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-
-          scp "${ssh_opts[@]}" \
-            ops/deploy/compose.yml \
-            ops/scripts/deploy/hermes-compose-deploy.sh \
-            ops/scripts/deploy/verify_running_stack.py \
-            "$target:$DEPLOY_ROOT/$incoming/"
-
-          ssh "${ssh_opts[@]}" "$target" bash -s -- \
-            "$DEPLOY_ROOT" "$incoming" "$DEPLOY_OPERATION" \
-            "$DEPLOY_ENVIRONMENT" "$IMAGE_REPOSITORY" \
-            "${IMAGE_DIGEST:--}" "$SOURCE_SHA" <<'REMOTE'
-          set -euo pipefail
-          deploy_root=$1
-          incoming=$2
-          operation=$3
-          environment=$4
-          image=$5
-          digest=$6
-          source_sha=$7
-
-          install -m 0644 "$deploy_root/$incoming/compose.yml" "$deploy_root/compose.yml"
-          install -m 0755 \
-            "$deploy_root/$incoming/hermes-compose-deploy.sh" \
-            "$deploy_root/hermes-compose-deploy.sh"
-          install -m 0755 \
-            "$deploy_root/$incoming/verify_running_stack.py" \
-            "$deploy_root/verify-running-stack.py"
-          exec "$deploy_root/hermes-compose-deploy.sh" \
-            "$operation" "$environment" "$image" "$digest" "$source_sha" "$deploy_root"
-          REMOTE
+          ssh "${ssh_opts[@]}" "$target" "$remote_command"

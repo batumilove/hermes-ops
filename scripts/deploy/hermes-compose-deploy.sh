@@ -4,11 +4,14 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  hermes-compose-deploy.sh deploy ENV IMAGE DIGEST SOURCE_SHA DEPLOY_ROOT
-  hermes-compose-deploy.sh rollback ENV IMAGE - SOURCE_SHA DEPLOY_ROOT
+  hermes-compose-deploy.sh deploy ENV IMAGE DIGEST SOURCE_SHA DEPLOY_ROOT ASSET_ROOT
+  hermes-compose-deploy.sh rollback ENV IMAGE DIGEST SOURCE_SHA DEPLOY_ROOT ASSET_ROOT
+
+The reviewed root-owned asset directory must already contain:
+  ASSET_ROOT/compose.yml
+  ASSET_ROOT/verify-running-stack.py
 
 The target must already contain:
-  DEPLOY_ROOT/compose.yml
   DEPLOY_ROOT/runtime.env (mode 0600; HERMES_DATA_DIR, HERMES_UID, HERMES_GID)
 
 Registry authentication and runtime secrets are host prerequisites. This script
@@ -22,42 +25,75 @@ die() {
   exit 1
 }
 
-[[ $# -eq 6 ]] || usage
+[[ $# -eq 7 ]] || usage
 operation=$1
 environment=$2
 image=$3
 digest=$4
 source_sha=$5
 deploy_root=$6
+asset_root=$7
 
 [[ $operation == deploy || $operation == rollback ]] || usage
 [[ $environment =~ ^[a-z][a-z0-9-]{1,31}$ ]] || die "invalid environment name"
 [[ $image == ghcr.io/batumilove/hermes-agent-deploy ]] || die "unexpected image repository"
 [[ $source_sha =~ ^[0-9a-f]{40}$ ]] || die "source SHA must be a full lowercase commit SHA"
 [[ $deploy_root == /* && $deploy_root != / ]] || die "deployment root must be an absolute non-root path"
-if [[ $operation == deploy ]]; then
-  [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || die "image digest must be sha256:<64 lowercase hex characters>"
-fi
-
-command -v docker >/dev/null || die "docker is not installed"
-docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is not installed"
-command -v flock >/dev/null || die "flock is not installed"
+[[ $asset_root == /* && $asset_root != / ]] || die "asset root must be an absolute non-root path"
+[[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || die "image digest must be sha256:<64 lowercase hex characters>"
 
 mkdir -p "$deploy_root/releases"
-compose_file="$deploy_root/compose.yml"
+compose_file="$asset_root/compose.yml"
 runtime_env="$deploy_root/runtime.env"
 current_env="$deploy_root/release.env"
 previous_env="$deploy_root/release.previous.env"
 history_file="$deploy_root/releases/history.tsv"
-acceptance_helper="$deploy_root/verify-running-stack.py"
+acceptance_helper="$asset_root/verify-running-stack.py"
 lock_file="$deploy_root/deploy.lock"
 shared_staging_lock=/run/lock/hermes-staging-diagnostic.lock
 
-[[ -f $compose_file ]] || die "missing $compose_file"
+[[ -f $compose_file && ! -L $compose_file ]] || die "missing or unsafe $compose_file"
 [[ -f $runtime_env ]] || die "missing $runtime_env"
 [[ -f $acceptance_helper && ! -L $acceptance_helper ]] || die "missing or unsafe $acceptance_helper"
-runtime_mode=$(stat -c '%a' "$runtime_env")
-(( (8#$runtime_mode & 077) == 0 )) || die "$runtime_env must not be group/world accessible (expected mode 0600)"
+[[ -f $runtime_env && ! -L $runtime_env && $(stat -c '%h:%u:%a' -- "$runtime_env") == "1:$EUID:600" ]] || \
+  die "$runtime_env must not be group/world accessible, must be single-link owned by the deployment controller, and must have expected mode 0600"
+python3 - "$runtime_env" <<'PY' || die "invalid runtime environment"
+import pathlib, re, stat, sys
+
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines()
+if len(lines) != 3 or any("=" not in line for line in lines):
+    raise SystemExit(1)
+values = dict(line.split("=", 1) for line in lines)
+if set(values) != {"HERMES_DATA_DIR", "HERMES_UID", "HERMES_GID"}:
+    raise SystemExit(1)
+data_dir = values["HERMES_DATA_DIR"]
+parts = pathlib.PurePosixPath(data_dir).parts
+if not re.fullmatch(r"/[A-Za-z0-9._/-]+", data_dir) or data_dir == "/" or ".." in parts:
+    raise SystemExit(1)
+for name in ("HERMES_UID", "HERMES_GID"):
+    if not re.fullmatch(r"[1-9][0-9]{0,9}", values[name]):
+        raise SystemExit(1)
+data_path = pathlib.Path(data_dir)
+try:
+    metadata = data_path.lstat()
+except OSError as exc:
+    print(f"unsafe HERMES_DATA_DIR metadata: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if (
+    not stat.S_ISDIR(metadata.st_mode)
+    or data_path.is_symlink()
+    or metadata.st_uid != int(values["HERMES_UID"])
+    or metadata.st_gid != int(values["HERMES_GID"])
+    or stat.S_IMODE(metadata.st_mode) & 0o077
+):
+    print("unsafe HERMES_DATA_DIR metadata", file=sys.stderr)
+    raise SystemExit(1)
+PY
+
+command -v docker >/dev/null || die "docker is not installed"
+docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is not installed"
+command -v flock >/dev/null || die "flock is not installed"
 
 if [[ $environment == batumi-staging && -e $shared_staging_lock ]]; then
   [[ -f $shared_staging_lock && ! -L $shared_staging_lock ]] || die "unsafe shared staging lock"
@@ -103,6 +139,10 @@ record_evidence() {
 
 if [[ $operation == rollback ]]; then
   [[ -s $previous_env ]] || die "no previous release is available for rollback"
+  rollback_digest=$(sed -n 's/^HERMES_IMAGE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$previous_env")
+  rollback_source=$(sed -n 's/^HERMES_SOURCE_SHA=\([0-9a-f]\{40\}\)$/\1/p' "$previous_env")
+  [[ $rollback_digest == "$digest" ]] || die "rollback target digest mismatch"
+  [[ $rollback_source == "$source_sha" ]] || die "rollback target source SHA mismatch"
   rollback_from="$deploy_root/release.rollback-from.env"
   cp -p "$current_env" "$rollback_from"
   cp -p "$previous_env" "$current_env"

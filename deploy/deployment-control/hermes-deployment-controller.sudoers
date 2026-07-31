@@ -1,0 +1,6 @@
+# Installed only after exact reviewed artifacts, ownership, and Docker access isolation pass.
+# Deployment automation may apply a release but cannot acquire/release soak leases.
+%hermes-deploy ALL=(root) NOPASSWD: sha256:__CONTROLLER_SHA256__ /usr/local/libexec/hermes-deployment-controller apply *
+
+# The soak controller is a separate principal and cannot deploy or clear emergencies.
+%hermes-soak ALL=(root) NOPASSWD: sha256:__CONTROLLER_SHA256__ /usr/local/libexec/hermes-deployment-controller soak-acquire *, sha256:__CONTROLLER_SHA256__ /usr/local/libexec/hermes-deployment-controller soak-release *, sha256:__CONTROLLER_SHA256__ /usr/local/libexec/hermes-deployment-controller status *
