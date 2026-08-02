@@ -22,14 +22,23 @@ def _module() -> ModuleType:
     return module
 
 
-def _run(*, name: str, status: str, conclusion: str | None, app_id: int = 15368) -> dict:
-    return {
+def _run(
+    *,
+    name: str,
+    status: str,
+    conclusion: str | None,
+    app_id: int = 15368,
+    started_at: str | None = "2026-08-02T19:35:35Z",
+) -> dict:
+    run = {
         "name": name,
         "status": status,
         "conclusion": conclusion,
-        "started_at": "2026-08-02T19:35:35Z",
         "app": {"id": app_id},
     }
+    if started_at is not None:
+        run["started_at"] = started_at
+    return run
 
 
 def test_exact_live_sha_and_github_actions_shadow_aggregate_passes() -> None:
@@ -109,6 +118,58 @@ def test_stale_branch_head_is_rejected_before_check_evaluation() -> None:
                 ]
             },
         )
+
+
+@pytest.mark.parametrize("started_at", [None, "not-a-timestamp"])
+def test_matching_run_with_invalid_started_at_is_rejected(
+    started_at: str | None,
+) -> None:
+    payload = {
+        "check_runs": [
+            _run(
+                name="shadow / shadow",
+                status="completed",
+                conclusion="success",
+                started_at=started_at,
+            )
+        ]
+    }
+
+    with pytest.raises(ValueError, match="invalid started_at"):
+        _module().evaluate_gate(
+            expected_sha=EXPECTED_SHA,
+            actual_sha=EXPECTED_SHA,
+            required_context="shadow / shadow",
+            payload=payload,
+        )
+
+
+def test_newest_matching_run_controls_the_result() -> None:
+    payload = {
+        "check_runs": [
+            _run(
+                name="shadow / shadow",
+                status="completed",
+                conclusion="success",
+                started_at="2026-08-02T19:35:35Z",
+            ),
+            _run(
+                name="shadow / shadow",
+                status="completed",
+                conclusion="failure",
+                started_at="2026-08-02T19:36:35Z",
+            ),
+        ]
+    }
+
+    result = _module().evaluate_gate(
+        expected_sha=EXPECTED_SHA,
+        actual_sha=EXPECTED_SHA,
+        required_context="shadow / shadow",
+        payload=payload,
+    )
+
+    assert result == "completed:failure"
 
 
 def test_workflow_uses_reviewed_gate_evaluator() -> None:

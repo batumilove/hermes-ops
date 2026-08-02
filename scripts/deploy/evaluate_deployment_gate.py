@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import sys
 from typing import Any
@@ -38,7 +39,22 @@ def evaluate_gate(
         and isinstance(run.get("app"), dict)
         and run["app"].get("id") == app_id
     ]
-    matching_runs.sort(key=lambda run: run.get("started_at") or "")
+
+    def started_at(run: dict[str, Any]) -> datetime:
+        value = run.get("started_at")
+        if not isinstance(value, str):
+            raise ValueError("matching check run has invalid started_at")
+        try:
+            parsed = datetime.fromisoformat(
+                value[:-1] + "+00:00" if value.endswith("Z") else value
+            )
+        except ValueError as exc:
+            raise ValueError("matching check run has invalid started_at") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("matching check run has invalid started_at")
+        return parsed
+
+    matching_runs.sort(key=started_at)
     run = matching_runs[-1] if matching_runs else {}
     return f"{run.get('status', 'missing')}:{run.get('conclusion') or 'pending'}"
 
