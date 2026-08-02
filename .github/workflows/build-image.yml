@@ -65,23 +65,12 @@ jobs:
             latest=$(gh api \
               "repos/batumilove/hermes-agent/branches/${source_branch//\\//%2F}" \
               --jq '.commit.sha')
-            test "$latest" = "$EXPECTED_SHA" || {
-              echo "Refusing stale deployment: branch=$source_branch head=$latest workflow=$EXPECTED_SHA" >&2
-              exit 1
-            }
             result=$(gh api \
               "repos/batumilove/hermes-agent/commits/$EXPECTED_SHA/check-runs?filter=latest&per_page=100" \
-              | python3 -c '
-          import json, os, sys
-          runs = [
-              run for run in json.load(sys.stdin).get("check_runs", [])
-              if run.get("name") == os.environ["required_context"]
-              and run.get("app", {}).get("id") == 15368
-          ]
-          runs.sort(key=lambda run: run.get("started_at") or "")
-          run = runs[-1] if runs else {}
-          print(f"{run.get('"'"'status'"'"', '"'"'missing'"'"')}:{run.get('"'"'conclusion'"'"') or '"'"'pending'"'"'}")
-          ')
+              | python3 ops/scripts/deploy/evaluate_deployment_gate.py \
+                  --expected-sha "$EXPECTED_SHA" \
+                  --actual-sha "$latest" \
+                  --required-context "$required_context")
             case "$result" in
               completed:success) exit 0 ;;
               completed:failure|completed:cancelled|completed:timed_out|completed:action_required)
