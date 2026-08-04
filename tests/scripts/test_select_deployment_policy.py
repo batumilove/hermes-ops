@@ -22,7 +22,7 @@ def _module() -> ModuleType:
 @pytest.mark.parametrize(
     ("lane", "expected"),
     [
-        ("live", ("batumi/live", "All required checks pass")),
+        ("live", ("batumi/live", "shadow / shadow")),
         ("candidate", ("rebuild/batumi-live", "shadow / shadow")),
     ],
 )

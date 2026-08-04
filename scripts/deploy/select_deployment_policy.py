@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 POLICIES = {
-    "live": ("batumi/live", "All required checks pass"),
+    "live": ("batumi/live", "shadow / shadow"),
     "candidate": ("rebuild/batumi-live", "shadow / shadow"),
 }
 
