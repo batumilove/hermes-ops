@@ -151,7 +151,6 @@ jobs:
             --source-sha "$EXPECTED_SHA" \
             --source-uri "$EXPECTED_SOURCE_URI"
       - name: Set up Docker Buildx
-        if: steps.resolve.outputs.exists == 'false'
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Build and publish immutable image
         id: build
@@ -164,7 +163,6 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE_REPOSITORY }}:sha-${{ inputs.source_sha }}
-            ${{ env.IMAGE_REPOSITORY }}:candidate
           labels: |
             org.opencontainers.image.revision=${{ inputs.source_sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -181,3 +179,23 @@ jobs:
           subject-name: ${{ env.IMAGE_REPOSITORY }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+      - name: Block fixable high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REPOSITORY }}@${{ steps.resolve.outputs.digest || steps.build.outputs.digest }}
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          timeout: 10m
+
+      - name: Promote scanned image to candidate
+        env:
+          TARGET_DIGEST: ${{ steps.resolve.outputs.digest || steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "${IMAGE_REPOSITORY}:candidate" \
+            "${IMAGE_REPOSITORY}@${TARGET_DIGEST}"
