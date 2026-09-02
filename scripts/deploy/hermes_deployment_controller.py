@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -48,6 +49,8 @@ EXPECTED_MODES = {
     "installer": 0o755,
     "sudoers": 0o600,
 }
+DEPLOY_TIMEOUT_SECONDS = 1080
+TERMINATE_GRACE_SECONDS = 5.0
 
 
 class ControlError(RuntimeError):
@@ -63,6 +66,10 @@ class LeaseConflict(ControlError):
 
 
 class ArtifactViolation(ControlError):
+    pass
+
+
+class RunnerTimeout(ControlError):
     pass
 
 
@@ -89,8 +96,39 @@ def _load_json(path: Path) -> object:
         raise ValidationError(f"invalid JSON state: {path}") from exc
 
 
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _terminate_process_group(process: subprocess.Popen, grace_seconds: float) -> None:
+    deadline = time.monotonic() + grace_seconds
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        pass
+    while _process_group_exists(process.pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if _process_group_exists(process.pid):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired as exc:
+        raise RunnerTimeout("deployment process group could not be terminated") from exc
+
+
 def _default_runner(argv: list[str], timeout: int) -> int:
-    completed = subprocess.run(
+    process = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
         env={
@@ -99,10 +137,13 @@ def _default_runner(argv: list[str], timeout: int) -> int:
             "TZ": "UTC",
             "HOME": "/root",
         },
-        timeout=timeout,
-        check=False,
+        start_new_session=True,
     )
-    return completed.returncode
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_group(process, TERMINATE_GRACE_SECONDS)
+        raise RunnerTimeout(f"deployment command exceeded {timeout} seconds") from exc
 
 
 class ControlPlane:
@@ -426,8 +467,20 @@ class ControlPlane:
             ]
             result: int | None = None
             try:
-                result = self.runner(argv, 1200)
+                result = self.runner(argv, DEPLOY_TIMEOUT_SECONDS)
                 return result
+            except RunnerTimeout:
+                result = 124
+                self._audit(
+                    "deployment-timed-out",
+                    environment=environment,
+                    lease_id=lease_id,
+                    operation=operation,
+                    source_sha=source_sha,
+                    image_digest=digest,
+                    timeout_seconds=DEPLOY_TIMEOUT_SECONDS,
+                )
+                raise
             finally:
                 lease_path = self.lease_path(environment)
                 try:
