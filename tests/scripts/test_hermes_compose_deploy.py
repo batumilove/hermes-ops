@@ -112,7 +112,22 @@ print(format_string)
     stat.chmod(0o755)
     timeout = bin_dir / "timeout"
     timeout.write_text(
-        "#!/usr/bin/env bash\nset -euo pipefail\nshift\nexec \"$@\"\n"
+        """#!/usr/bin/env bash
+set -euo pipefail
+while [[ ${1:-} == -* ]]; do
+  case $1 in
+    --signal=*|--kill-after=*) shift ;;
+    *) exit 64 ;;
+  esac
+done
+duration=${1:?}
+shift
+printf '%s %s\\n' "$duration" "$*" >> "${FAKE_TIMEOUT_LOG:?}"
+if [[ ${FAKE_TIMEOUT_PULL:-0} == 1 && $* == *'pull gateway'* ]]; then
+  exit 124
+fi
+exec "$@"
+"""
     )
     timeout.chmod(0o755)
 
@@ -124,6 +139,7 @@ def _run(root: Path, bin_dir: Path, *args: str) -> subprocess.CompletedProcess[s
     env["FAKE_DOCKER_FAIL_ONCE"] = str(root / "fail-once")
     env["FAKE_ACCEPTANCE_FAIL_ONCE"] = str(root / "acceptance-fail-once")
     env["FAKE_DEPLOY_ROOT"] = str(root)
+    env["FAKE_TIMEOUT_LOG"] = str(root / "timeout.log")
     return subprocess.run(
         ["bash", str(SCRIPT), *args, str(root), str(root / "reviewed-assets")],
         text=True,
@@ -177,6 +193,28 @@ def test_deploy_uses_immutable_digest_and_records_evidence(tmp_path: Path) -> No
     log = (root / "docker.log").read_text()
     assert "pull gateway" in log
     assert "up -d --wait --wait-timeout 300 --remove-orphans" in log
+
+
+def test_pull_timeout_restores_previous_release_without_replacing_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+    assert first.returncode == 0, first.stderr
+    monkeypatch.setenv("FAKE_TIMEOUT_PULL", "1")
+
+    failed = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_TWO, SHA)
+
+    assert failed.returncode != 0
+    assert "image pull timed out" in failed.stderr
+    assert DIGEST_ONE in (root / "release.env").read_text()
+    history = (root / "releases" / "history.tsv").read_text()
+    assert "\tpull-timeout\tstaging\t" in history
+    log = (root / "docker.log").read_text()
+    assert log.count("up -d --wait --wait-timeout 300 --remove-orphans") == 1
+    timeout_log = (root / "timeout.log").read_text()
+    assert "720s " in timeout_log
+    assert "pull gateway" in timeout_log
 
 
 def test_failed_health_check_restores_previous_release(tmp_path: Path) -> None:

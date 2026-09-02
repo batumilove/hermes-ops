@@ -101,6 +101,9 @@ jobs:
             -o IdentitiesOnly=yes
             -o StrictHostKeyChecking=yes
             -o ConnectTimeout=15
+            -o ConnectionAttempts=1
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=3
           )
 
           controller="github-actions:compose-deploy:${GITHUB_RUN_ID}"
@@ -115,4 +118,5 @@ jobs:
           printf -v remote_command '%q ' "${remote_args[@]}"
           # remote_command is locally built with printf %q for remote parsing.
           # shellcheck disable=SC2029
-          ssh "${ssh_opts[@]}" "$target" "$remote_command"
+          timeout --signal=TERM --kill-after=10s 1140s \
+            ssh "${ssh_opts[@]}" "$target" "$remote_command"

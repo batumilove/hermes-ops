@@ -4,11 +4,14 @@ import hashlib
 import importlib.util
 import json
 import os
+import signal
 import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,14 +46,21 @@ def test_default_runner_preserves_root_docker_auth_home(monkeypatch: pytest.Monk
     module = _load()
     observed: dict[str, object] = {}
 
-    def fake_run(argv, **kwargs):
+    class FakeProcess:
+        pid = 1234
+
+        def wait(self, **kwargs):
+            observed["wait"] = kwargs
+            return 0
+
+    def fake_popen(argv, **kwargs):
         observed["argv"] = argv
         observed.update(kwargs)
-        return SimpleNamespace(returncode=0)
+        return FakeProcess()
 
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
 
-    assert module._default_runner(["/reviewed/deployer", "deploy"], 1200) == 0
+    assert module._default_runner(["/reviewed/deployer", "deploy"], 1080) == 0
     assert observed["env"] == {
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
         "LANG": "C.UTF-8",
@@ -59,8 +69,61 @@ def test_default_runner_preserves_root_docker_auth_home(monkeypatch: pytest.Monk
     }
     assert observed["argv"] == ["/reviewed/deployer", "deploy"]
     assert observed["stdin"] is subprocess.DEVNULL
-    assert observed["timeout"] == 1200
-    assert observed["check"] is False
+    assert observed["start_new_session"] is True
+    assert observed["wait"] == {"timeout": 1080}
+
+
+def test_default_runner_timeout_terminates_complete_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load()
+    monkeypatch.setattr(module, "TERMINATE_GRACE_SECONDS", 0.05, raising=False)
+    child_pid_file = tmp_path / "child.pid"
+    child_code = """
+import os
+import signal
+import sys
+import time
+
+child = os.fork()
+if child == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(sys.argv[1], "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+    while True:
+        time.sleep(1)
+while True:
+    time.sleep(1)
+"""
+
+    caught: BaseException | None = None
+    try:
+        module._default_runner(
+            [sys.executable, "-c", child_code, str(child_pid_file)], 0.2
+        )
+    except BaseException as exc:  # noqa: BLE001 - asserted below
+        caught = exc
+
+    assert child_pid_file.exists()
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    try:
+        os.kill(child_pid, 0)
+    except ProcessLookupError:
+        child_alive = False
+    else:
+        child_alive = True
+        os.kill(child_pid, signal.SIGKILL)
+
+    assert isinstance(caught, module.ControlError)
+    assert "exceeded 0.2 seconds" in str(caught)
+    assert child_alive is False
 
 
 def _fixture(tmp_path: Path, runner=None):
@@ -162,13 +225,46 @@ def test_apply_records_exact_transaction_identity_while_running(tmp_path: Path) 
             "deploy", "batumi-staging", IMAGE, DIGEST, SHA,
             str(deploy_root), str(artifact_paths["compose"].parent),
         ],
-        "timeout": 1200,
+        "timeout": 1080,
     }
     assert not (tmp_path / "state/leases/batumi-staging.json").exists()
     audit = [json.loads(line) for line in (tmp_path / "state/audit.jsonl").read_text().splitlines()]
     assert [item["event"] for item in audit] == ["deployment-acquired", "deployment-released"]
     assert stat.S_IMODE((tmp_path / "state").stat().st_mode) == 0o700
     assert stat.S_IMODE((tmp_path / "state/audit.jsonl").stat().st_mode) == 0o600
+
+
+def test_apply_timeout_records_terminal_audit_and_releases_owned_lease(
+    tmp_path: Path,
+) -> None:
+    loaded: dict[str, object] = {}
+
+    def runner(argv: list[str], timeout: int) -> int:
+        module = loaded["module"]
+        timeout_type = getattr(module, "RunnerTimeout", None)
+        if timeout_type is not None:
+            raise timeout_type(f"deployment command exceeded {timeout} seconds")
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    module, plane, _, _, _ = _fixture(tmp_path, runner)
+    loaded["module"] = module
+
+    caught: BaseException | None = None
+    try:
+        _apply(plane)
+    except BaseException as exc:  # noqa: BLE001 - asserted below
+        caught = exc
+
+    assert isinstance(caught, module.ControlError)
+    assert not plane.lease_path("batumi-staging").exists()
+    audit = [json.loads(line) for line in plane.audit_path.read_text().splitlines()]
+    assert [item["event"] for item in audit] == [
+        "deployment-acquired",
+        "deployment-timed-out",
+        "deployment-released",
+    ]
+    assert audit[-2]["timeout_seconds"] == 1080
+    assert audit[-1]["result"] == 124
 
 
 def test_malformed_transaction_lease_is_removed_and_release_is_audited(

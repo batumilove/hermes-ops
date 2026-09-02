@@ -94,6 +94,7 @@ PY
 command -v docker >/dev/null || die "docker is not installed"
 docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is not installed"
 command -v flock >/dev/null || die "flock is not installed"
+command -v timeout >/dev/null || die "timeout is not installed"
 
 if [[ $environment == batumi-staging && -e $shared_staging_lock ]]; then
   [[ -f $shared_staging_lock && ! -L $shared_staging_lock ]] || die "unsafe shared staging lock"
@@ -178,11 +179,24 @@ mv -f "$candidate" "$current_env"
 
 # Pull before replacement so a registry/network failure cannot stop the current
 # healthy container. The image reference is digest-pinned by validation above.
-if ! compose pull gateway; then
+# This leaves six minutes inside the 18-minute controller budget for replacement,
+# health verification, acceptance, evidence, and cleanup.
+pull_rc=0
+timeout --signal=TERM --kill-after=10s 720s docker compose \
+  --project-name "hermes-$environment" \
+  --env-file "$runtime_env" \
+  --env-file "$current_env" \
+  -f "$compose_file" \
+  pull gateway || pull_rc=$?
+if (( pull_rc != 0 )); then
   if [[ $had_current == true ]]; then
     cp -p "$previous_env" "$current_env"
   else
     rm -f "$current_env"
+  fi
+  if (( pull_rc == 124 || pull_rc == 137 )); then
+    record_evidence pull-timeout "$digest"
+    die "image pull timed out; current release was left untouched"
   fi
   record_evidence pull-failed "$digest"
   die "image pull failed; current release was left untouched"
