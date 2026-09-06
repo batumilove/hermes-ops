@@ -39,13 +39,14 @@ RUN_ID_RE = re.compile(r"[1-9][0-9]{0,19}")
 ATTEMPT_RE = re.compile(r"[1-9][0-9]{0,5}")
 LEASE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{15,127}")
 EXPECTED_ARTIFACTS = {
-    "controller", "deployer", "compose", "acceptance", "installer", "sudoers"
+    "controller", "deployer", "compose", "acceptance", "retention", "installer", "sudoers"
 }
 EXPECTED_MODES = {
     "controller": 0o755,
     "deployer": 0o755,
     "compose": 0o644,
     "acceptance": 0o755,
+    "retention": 0o755,
     "installer": 0o755,
     "sudoers": 0o600,
 }
