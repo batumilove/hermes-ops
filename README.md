@@ -7,6 +7,7 @@ Fork-owned operational tooling for Hermes deployments:
 - staging Telegram socket diagnostics with crash recovery
 - reusable shadow validation and deployment workflows
 - container supervision assets and operational evidence recording
+- post-acceptance image retention that preserves the active image, two unique rollback images, and every container-referenced image
 
 The application fork invokes workflows from this repository by full commit
 SHA. Deployment callers must also pass the same reviewed `ops_sha`; the

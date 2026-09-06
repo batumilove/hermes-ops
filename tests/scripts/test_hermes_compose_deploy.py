@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -140,6 +141,8 @@ def _run(root: Path, bin_dir: Path, *args: str) -> subprocess.CompletedProcess[s
     env["FAKE_ACCEPTANCE_FAIL_ONCE"] = str(root / "acceptance-fail-once")
     env["FAKE_DEPLOY_ROOT"] = str(root)
     env["FAKE_TIMEOUT_LOG"] = str(root / "timeout.log")
+    env["FAKE_RETENTION_LOG"] = str(root / "retention.log")
+    env["FAKE_RETENTION_FAIL"] = "1" if (root / "retention-fail").exists() else "0"
     return subprocess.run(
         ["bash", str(SCRIPT), *args, str(root), str(root / "reviewed-assets")],
         text=True,
@@ -158,6 +161,22 @@ def _prepare(tmp_path: Path) -> tuple[Path, Path]:
     (assets / "verify-running-stack.py").write_text(
         ACCEPTANCE.read_text(encoding="utf-8"), encoding="utf-8"
     )
+    retention = assets / "prune-deployment-images.py"
+    retention.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+with open(os.environ["FAKE_RETENTION_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\\n")
+if os.environ.get("FAKE_RETENTION_FAIL") == "1":
+    print("injected retention failure", file=sys.stderr)
+    raise SystemExit(1)
+print('{"removed_digests":[],"retained_digests":[],"reclaimed_bytes":0}')
+""",
+        encoding="utf-8",
+    )
+    retention.chmod(0o755)
     data_root = tmp_path / "data"
     data_root.mkdir(mode=0o700)
     runtime_uid = os.getuid()
@@ -193,6 +212,37 @@ def test_deploy_uses_immutable_digest_and_records_evidence(tmp_path: Path) -> No
     log = (root / "docker.log").read_text()
     assert "pull gateway" in log
     assert "up -d --wait --wait-timeout 300 --remove-orphans" in log
+
+
+def test_successful_deploy_runs_bounded_image_retention(tmp_path: Path) -> None:
+    root, bin_dir = _prepare(tmp_path)
+
+    result = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in (root / "retention.log").read_text().splitlines()]
+    assert calls == [[
+        "--repository", IMAGE,
+        "--active-digest", DIGEST_ONE,
+        "--history-file", str(root / "releases" / "history.tsv"),
+        "--rollback-images", "2",
+    ]]
+    assert '"reclaimed_bytes":0' in result.stdout
+
+
+def test_retention_failure_does_not_disrupt_verified_deployment(tmp_path: Path) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    (root / "retention-fail").touch()
+
+    result = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+
+    assert result.returncode == 0
+    assert "Deployment complete" in result.stdout
+    assert "WARNING: deployment image retention failed closed" in result.stderr
+    assert DIGEST_ONE in (root / "release.env").read_text()
+    history = (root / "releases" / "history.tsv").read_text()
+    assert "\tdeployed\tstaging\t" in history
+    assert "\timage-retention-failed\tstaging\t" in history
 
 
 def test_pull_timeout_restores_previous_release_without_replacing_container(

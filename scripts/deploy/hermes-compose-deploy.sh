@@ -10,6 +10,7 @@ Usage:
 The reviewed root-owned asset directory must already contain:
   ASSET_ROOT/compose.yml
   ASSET_ROOT/verify-running-stack.py
+  ASSET_ROOT/prune-deployment-images.py
 
 The target must already contain:
   DEPLOY_ROOT/runtime.env (mode 0600; HERMES_DATA_DIR, HERMES_UID, HERMES_GID)
@@ -49,12 +50,14 @@ current_env="$deploy_root/release.env"
 previous_env="$deploy_root/release.previous.env"
 history_file="$deploy_root/releases/history.tsv"
 acceptance_helper="$asset_root/verify-running-stack.py"
+retention_helper="$asset_root/prune-deployment-images.py"
 lock_file="$deploy_root/deploy.lock"
 shared_staging_lock=/run/lock/hermes-staging-diagnostic.lock
 
 [[ -f $compose_file && ! -L $compose_file ]] || die "missing or unsafe $compose_file"
 [[ -f $runtime_env ]] || die "missing $runtime_env"
 [[ -f $acceptance_helper && ! -L $acceptance_helper ]] || die "missing or unsafe $acceptance_helper"
+[[ -f $retention_helper && ! -L $retention_helper ]] || die "missing or unsafe $retention_helper"
 [[ -f $runtime_env && ! -L $runtime_env && $(stat -c '%h:%u:%a' -- "$runtime_env") == "1:$EUID:600" ]] || \
   die "$runtime_env must not be group/world accessible, must be single-link owned by the deployment controller, and must have expected mode 0600"
 python3 - "$runtime_env" <<'PY' || die "invalid runtime environment"
@@ -213,6 +216,14 @@ if verify_release; then
     record_evidence deployed "$digest"
     printf 'Deployment complete: environment=%s source=%s digest=%s\n' \
       "$environment" "$source_sha" "$digest"
+    if ! python3 "$retention_helper" \
+      --repository "$image" \
+      --active-digest "$digest" \
+      --history-file "$history_file" \
+      --rollback-images 2; then
+      record_evidence image-retention-failed "$digest"
+      printf 'WARNING: deployment image retention failed closed; verified deployment remains active\n' >&2
+    fi
     exit 0
   fi
   failure_result="acceptance-failed"

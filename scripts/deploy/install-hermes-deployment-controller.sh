@@ -49,6 +49,7 @@ installed_controller=/usr/local/libexec/hermes-deployment-controller
 asset_root=/usr/local/libexec/hermes-deployment
 installed_deployer=$asset_root/hermes-compose-deploy.sh
 installed_acceptance=$asset_root/verify-running-stack.py
+installed_retention=$asset_root/prune-deployment-images.py
 installed_compose=$asset_root/compose.yml
 state_root=/var/lib/hermes-deployment-control
 manifest=$state_root/artifact-manifest.json
@@ -133,6 +134,7 @@ if [[ $mode == --stage ]]; then
   materialize_reviewed_blob scripts/deploy/hermes_deployment_controller.py "$installed_controller" 0755
   materialize_reviewed_blob scripts/deploy/hermes-compose-deploy.sh "$installed_deployer" 0755
   materialize_reviewed_blob scripts/deploy/verify_running_stack.py "$installed_acceptance" 0755
+  materialize_reviewed_blob scripts/deploy/prune_deployment_images.py "$installed_retention" 0755
   materialize_reviewed_blob deploy/compose.yml "$installed_compose" 0644
   materialize_reviewed_blob deploy/deployment-control/hermes-deployment-controller.sudoers "$staged_sudoers" 0600
 
@@ -155,14 +157,15 @@ PY
 
   python3 - "$manifest.tmp" "$reviewed_commit" "$reviewed_tree" \
     "$installed_controller" "$installed_deployer" "$installed_compose" "$installed_acceptance" \
-    "$installed_installer" "$staged_sudoers" <<'PY'
+    "$installed_retention" "$installed_installer" "$staged_sudoers" <<'PY'
 import hashlib, json, pathlib, stat, sys
-output, reviewed_commit, reviewed_tree, controller, deployer, compose, acceptance, installer, sudoers = sys.argv[1:]
+output, reviewed_commit, reviewed_tree, controller, deployer, compose, acceptance, retention, installer, sudoers = sys.argv[1:]
 paths = {
     "controller": controller,
     "deployer": deployer,
     "compose": compose,
     "acceptance": acceptance,
+    "retention": retention,
     "installer": installer,
     "sudoers": sudoers,
 }
@@ -218,6 +221,7 @@ expected = {
     "deployer": 0o755,
     "compose": 0o644,
     "acceptance": 0o755,
+    "retention": 0o755,
     "installer": 0o755,
     "sudoers": 0o600,
 }
