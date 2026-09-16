@@ -213,7 +213,7 @@ def test_pull_timeout_restores_previous_release_without_replacing_container(
     log = (root / "docker.log").read_text()
     assert log.count("up -d --wait --wait-timeout 300 --remove-orphans") == 1
     timeout_log = (root / "timeout.log").read_text()
-    assert "720s " in timeout_log
+    assert "1800s " in timeout_log
     assert "pull gateway" in timeout_log
 
 

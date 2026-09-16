@@ -60,7 +60,7 @@ def test_default_runner_preserves_root_docker_auth_home(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
 
-    assert module._default_runner(["/reviewed/deployer", "deploy"], 1080) == 0
+    assert module._default_runner(["/reviewed/deployer", "deploy"], 3000) == 0
     assert observed["env"] == {
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
         "LANG": "C.UTF-8",
@@ -70,7 +70,7 @@ def test_default_runner_preserves_root_docker_auth_home(monkeypatch: pytest.Monk
     assert observed["argv"] == ["/reviewed/deployer", "deploy"]
     assert observed["stdin"] is subprocess.DEVNULL
     assert observed["start_new_session"] is True
-    assert observed["wait"] == {"timeout": 1080}
+    assert observed["wait"] == {"timeout": 3000}
 
 
 def test_default_runner_timeout_terminates_complete_process_group(
@@ -219,13 +219,13 @@ def test_apply_records_exact_transaction_identity_while_running(tmp_path: Path) 
         "run_id": "30470000000",
         "run_attempt": "1",
         "acquired_at": "2026-07-29T16:00:00Z",
-        "expires_at": "2026-07-29T16:30:00Z",
+        "expires_at": "2026-07-29T16:55:00Z",
         "argv": [
             str(artifact_paths["deployer"]),
             "deploy", "batumi-staging", IMAGE, DIGEST, SHA,
             str(deploy_root), str(artifact_paths["compose"].parent),
         ],
-        "timeout": 1080,
+        "timeout": 3000,
     }
     assert not (tmp_path / "state/leases/batumi-staging.json").exists()
     audit = [json.loads(line) for line in (tmp_path / "state/audit.jsonl").read_text().splitlines()]
@@ -263,7 +263,7 @@ def test_apply_timeout_records_terminal_audit_and_releases_owned_lease(
         "deployment-timed-out",
         "deployment-released",
     ]
-    assert audit[-2]["timeout_seconds"] == 1080
+    assert audit[-2]["timeout_seconds"] == 3000
     assert audit[-1]["result"] == 124
 
 

@@ -42,7 +42,7 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     environment:
       name: ${{ inputs.environment }}
     env:
@@ -118,5 +118,5 @@ jobs:
           printf -v remote_command '%q ' "${remote_args[@]}"
           # remote_command is locally built with printf %q for remote parsing.
           # shellcheck disable=SC2029
-          timeout --signal=TERM --kill-after=10s 1140s \
+          timeout --signal=TERM --kill-after=10s 3300s \
             ssh "${ssh_opts[@]}" "$target" "$remote_command"

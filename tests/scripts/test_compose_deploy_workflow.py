@@ -45,8 +45,8 @@ def test_workflow_bounds_ssh_below_job_timeout_and_detects_dead_transport() -> N
     workflow, text = _workflow()
     job = workflow["jobs"]["deploy"]
 
-    assert job["timeout-minutes"] == 20
+    assert job["timeout-minutes"] == 60
     assert "-o ServerAliveInterval=15" in text
     assert "-o ServerAliveCountMax=3" in text
-    assert "timeout --signal=TERM --kill-after=10s 1140s" in text
+    assert "timeout --signal=TERM --kill-after=10s 3300s" in text
     assert 'ssh "${ssh_opts[@]}" "$target" "$remote_command"' in text

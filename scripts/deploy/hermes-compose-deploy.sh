@@ -179,10 +179,10 @@ mv -f "$candidate" "$current_env"
 
 # Pull before replacement so a registry/network failure cannot stop the current
 # healthy container. The image reference is digest-pinned by validation above.
-# This leaves six minutes inside the 18-minute controller budget for replacement,
+# This leaves twenty minutes inside the 50-minute controller budget for replacement,
 # health verification, acceptance, evidence, and cleanup.
 pull_rc=0
-timeout --signal=TERM --kill-after=10s 720s docker compose \
+timeout --signal=TERM --kill-after=10s 1800s docker compose \
   --project-name "hermes-$environment" \
   --env-file "$runtime_env" \
   --env-file "$current_env" \

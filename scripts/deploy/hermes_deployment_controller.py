@@ -49,7 +49,7 @@ EXPECTED_MODES = {
     "installer": 0o755,
     "sudoers": 0o600,
 }
-DEPLOY_TIMEOUT_SECONDS = 1080
+DEPLOY_TIMEOUT_SECONDS = 3000
 TERMINATE_GRACE_SECONDS = 5.0
 
 
@@ -457,7 +457,7 @@ class ControlPlane:
                 "run_id": run_id,
                 "run_attempt": run_attempt,
                 "acquired_at": _utc_text(acquired),
-                "expires_at": _utc_text(acquired + timedelta(minutes=30)),
+                "expires_at": _utc_text(acquired + timedelta(minutes=55)),
             }
             self._atomic_json(self.lease_path(environment), lease)
             self._audit("deployment-acquired", **lease)
