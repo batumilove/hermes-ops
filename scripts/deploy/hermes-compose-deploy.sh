@@ -61,7 +61,7 @@ runtime_env="$deploy_root/runtime.env"
 current_env="$deploy_root/release.env"
 previous_env="$deploy_root/release.previous.env"
 history_file="$deploy_root/releases/history.tsv"
-[[ ! -e $history_file || -f $history_file ]] || die "$history_file must be a regular file if present"
+[[ ! -e $history_file || (! -L $history_file && -f $history_file) ]] || die "$history_file must be a real regular file if present"
 acceptance_helper="$asset_root/verify-running-stack.py"
 lock_file="$deploy_root/deploy.lock"
 shared_staging_lock=/run/lock/hermes-staging-diagnostic.lock
@@ -133,9 +133,10 @@ root = pathlib.Path(sys.argv[1])
 for entry in root.iterdir():
     if not (entry.name.startswith("pull-") and (entry.name.endswith(".json") or entry.name.endswith(".log") or entry.name.endswith(".json.tmp"))):
         continue
-    # remove only non-regular entries and temporary files; complete pairs are
-    # decided below against their counterpart
-    if entry.name.endswith(".json.tmp") or entry.is_symlink():
+    # remove temporary and non-regular entries outright; complete pairs are
+    # decided below against their regular-file counterpart
+    is_regular = entry.is_file() and not entry.is_symlink()
+    if entry.name.endswith(".json.tmp") or not is_regular:
         if entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry)
         else:
@@ -195,16 +196,19 @@ if [[ $operation == rollback ]]; then
   [[ $rollback_source == "$source_sha" ]] || die "rollback target source SHA mismatch"
   rollback_from="$deploy_root/release.rollback-from.env"
   cp -p "$current_env" "$rollback_from"
-  cp -p "$previous_env" "$current_env"
+  cp -p "$previous_env" "$current_env.rollback"
+  mv -f "$current_env.rollback" "$current_env"
   if verify_release; then
-    cp -p "$rollback_from" "$previous_env"
+    cp -p "$rollback_from" "$previous_env.swap"
+    mv -f "$previous_env.swap" "$previous_env"
     deployed_digest=$(sed -n 's/^HERMES_IMAGE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$current_env")
     record_evidence rollback "$deployed_digest"
     rm -f "$rollback_from"
     printf 'Rollback complete: environment=%s digest=%s\n' "$environment" "$deployed_digest"
     exit 0
   fi
-  cp -p "$rollback_from" "$current_env"
+  cp -p "$rollback_from" "$current_env.rollback"
+  mv -f "$current_env.rollback" "$current_env"
   verify_release || true
   rm -f "$rollback_from"
   record_evidence rollback-failed unknown
@@ -322,7 +326,8 @@ if (( diagnostic_rc != 0 )); then
 fi
 # Retain only the twenty newest complete attempts. Metadata is published after
 # the log, so a missing JSON sidecar is never accepted as a complete record.
-python3 - "$pull_attempt_dir" <<'PY'
+retention_rc=0
+python3 - "$pull_attempt_dir" <<'PY' || retention_rc=$?
 import pathlib
 import sys
 
@@ -338,6 +343,11 @@ for entry in root.iterdir():
     if entry.name.startswith("pull-") and entry.name.endswith(".json"):
         meta = entry.lstat()
         if not stat_module.S_ISREG(meta.st_mode):
+            stray_log = entry.with_suffix(".log")
+            if stray_log.is_dir() and not stray_log.is_symlink():
+                shutil.rmtree(stray_log)
+            else:
+                stray_log.unlink(missing_ok=True)
             if entry.is_dir() and not entry.is_symlink():
                 shutil.rmtree(entry)
             else:
@@ -369,6 +379,11 @@ for _, record in complete[20:]:
     else:
         log.unlink(missing_ok=True)
 PY
+if (( retention_rc != 0 )); then
+  restore_release_atomically
+  rm -f "$pull_log" "$pull_attempt_dir/${pull_attempt_id}.json" "$pull_attempt_dir/${pull_attempt_id}.json.tmp"
+  die "pull evidence retention failed; current release was left untouched"
+fi
 if (( pull_rc != 0 )); then
   restore_release_atomically
   if (( pull_rc == 124 || pull_rc == 137 )); then
@@ -387,8 +402,8 @@ if verify_release; then
     --digest "$digest" \
     --source-sha "$source_sha" \
     --deploy-root "$deploy_root"; then
-    candidate_published=false
     record_evidence deployed "$digest"
+    candidate_published=false
     trap - EXIT INT TERM HUP
     printf 'Deployment complete: environment=%s source=%s digest=%s\n' \
       "$environment" "$source_sha" "$digest"
@@ -399,7 +414,7 @@ fi
 
 record_evidence "$failure_result" "$digest"
 if [[ $had_current == true ]]; then
-  cp -p "$previous_env" "$current_env"
+  restore_release_atomically
   if verify_release; then
     recovered_digest=$(sed -n 's/^HERMES_IMAGE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$current_env")
     record_evidence automatic-rollback "$recovered_digest"
