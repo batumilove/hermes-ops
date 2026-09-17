@@ -22,6 +22,7 @@ EOF
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
+  trap - EXIT INT TERM HUP
   exit 1
 }
 
@@ -42,12 +43,25 @@ asset_root=$7
 [[ $asset_root == /* && $asset_root != / ]] || die "asset root must be an absolute non-root path"
 [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || die "image digest must be sha256:<64 lowercase hex characters>"
 
+umask 077
+[[ ! -L $deploy_root && -d $deploy_root ]] || die "deployment root must be a real directory"
+releases_dir="$deploy_root/releases"
+if [[ -e $releases_dir && ! -d $releases_dir ]]; then
+  die "$releases_dir must be a directory if present"
+fi
+[[ -e $releases_dir && -L $releases_dir ]] && die "$releases_dir must not be a symlink"
 mkdir -p "$deploy_root/releases"
+pull_attempt_dir="$deploy_root/releases/pull-attempts"
+mkdir -p "$pull_attempt_dir"
+[[ -d $pull_attempt_dir && ! -L $pull_attempt_dir && $(stat -c '%u:%a' -- "$pull_attempt_dir") == "$EUID:700" ]] || \
+  die "$pull_attempt_dir must be a private directory owned by the deployment controller"
+[[ ! -L $deploy_root && -d $deploy_root ]] || die "deployment root must be a real directory"
 compose_file="$asset_root/compose.yml"
 runtime_env="$deploy_root/runtime.env"
 current_env="$deploy_root/release.env"
 previous_env="$deploy_root/release.previous.env"
 history_file="$deploy_root/releases/history.tsv"
+[[ ! -e $history_file || (! -L $history_file && -f $history_file) ]] || die "$history_file must be a real regular file if present"
 acceptance_helper="$asset_root/verify-running-stack.py"
 lock_file="$deploy_root/deploy.lock"
 shared_staging_lock=/run/lock/hermes-staging-diagnostic.lock
@@ -107,6 +121,42 @@ else
 fi
 flock -w 300 9 || die "timed out waiting for deployment lock"
 
+# Cleanup is serialized by the deployment lock so it cannot race an active
+# pull whose log exists before its final JSON sidecar.
+python3 - "$pull_attempt_dir" <<'PY'
+import pathlib
+import shutil
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for entry in root.iterdir():
+    if not (entry.name.startswith("pull-") and (entry.name.endswith(".json") or entry.name.endswith(".log") or entry.name.endswith(".json.tmp"))):
+        continue
+    # remove temporary and non-regular entries outright; complete pairs are
+    # decided below against their regular-file counterpart
+    is_regular = entry.is_file() and not entry.is_symlink()
+    if entry.name.endswith(".json.tmp") or not is_regular:
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink(missing_ok=True)
+
+# keep only entries that are members of a complete regular-file pair
+logs = {entry for entry in root.iterdir() if entry.name.startswith("pull-") and entry.name.endswith(".log")}
+jsons = {entry for entry in root.iterdir() if entry.name.startswith("pull-") and entry.name.endswith(".json")}
+for log in logs:
+    meta = log.with_suffix(".json")
+    if meta not in jsons:
+        log.unlink(missing_ok=True)
+        jsons.discard(log.with_suffix(".json"))
+for meta in list(jsons):
+    log = meta.with_suffix(".log")
+    if log not in logs:
+        meta.unlink(missing_ok=True)
+        jsons.discard(meta)
+PY
+
 compose() {
   docker compose \
     --project-name "hermes-$environment" \
@@ -138,32 +188,82 @@ record_evidence() {
     "$source_sha" "$deployed_digest" >> "$history_file"
 }
 
+restore_candidate_release() {
+  local rc=$?
+  if [[ ${candidate_published:-false} == true ]]; then
+    local source_env="${rollback_saved_env:-$previous_env}"
+    if [[ $had_current == true ]]; then
+      cp -p "$source_env" "$current_env.restore"
+      mv -f "$current_env.restore" "$current_env"
+      verify_release >/dev/null 2>&1 || true
+    else
+      rm -f "$current_env"
+    fi
+  fi
+  return "$rc"
+}
+
+restore_release_atomically() {
+  if [[ $had_current == true ]]; then
+    cp -p "$previous_env" "$current_env.restore"
+    mv -f "$current_env.restore" "$current_env"
+  else
+    rm -f "$current_env"
+  fi
+}
+terminate_after_restore() {
+  local rc=$1
+  restore_candidate_release
+  trap - EXIT INT TERM HUP
+  exit "$rc"
+}
+trap restore_candidate_release EXIT
+trap 'terminate_after_restore 130' INT
+trap 'terminate_after_restore 143' TERM
+trap 'terminate_after_restore 129' HUP
+
 if [[ $operation == rollback ]]; then
   [[ -s $previous_env ]] || die "no previous release is available for rollback"
+  had_current=true
   rollback_digest=$(sed -n 's/^HERMES_IMAGE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$previous_env")
   rollback_source=$(sed -n 's/^HERMES_SOURCE_SHA=\([0-9a-f]\{40\}\)$/\1/p' "$previous_env")
   [[ $rollback_digest == "$digest" ]] || die "rollback target digest mismatch"
   [[ $rollback_source == "$source_sha" ]] || die "rollback target source SHA mismatch"
   rollback_from="$deploy_root/release.rollback-from.env"
   cp -p "$current_env" "$rollback_from"
-  cp -p "$previous_env" "$current_env"
+  cp -p "$previous_env" "$current_env.rollback"
+  had_current=true
+  rollback_saved_env="$rollback_from"
+  candidate_published=true
+  mv -f "$current_env.rollback" "$current_env"
   if verify_release; then
-    cp -p "$rollback_from" "$previous_env"
+    cp -p "$rollback_from" "$previous_env.swap"
+    mv -f "$previous_env.swap" "$previous_env"
     deployed_digest=$(sed -n 's/^HERMES_IMAGE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$current_env")
     record_evidence rollback "$deployed_digest"
+    candidate_published=false
+    trap - EXIT INT TERM HUP
+    cp -p "$rollback_from" "$deploy_root/release.previous.env.swap"
+    mv -f "$deploy_root/release.previous.env.swap" "$deploy_root/release.previous.env"
     rm -f "$rollback_from"
     printf 'Rollback complete: environment=%s digest=%s\n' "$environment" "$deployed_digest"
     exit 0
   fi
-  cp -p "$rollback_from" "$current_env"
-  verify_release || true
-  rm -f "$rollback_from"
+  previous_env="$rollback_saved_env"
   record_evidence rollback-failed unknown
-  die "rollback candidate failed health verification; original release was restored"
+  candidate_published=false
+  restore_release_atomically
+  if verify_release; then
+    rm -f "$rollback_from"
+    trap - EXIT INT TERM HUP
+    die "rollback candidate failed health verification; original release was restored"
+  fi
+  rm -f "$rollback_from"
+  trap - EXIT INT TERM HUP
+  die "rollback candidate failed health verification; automatic restore also failed verification"
 fi
 
 candidate="$deploy_root/release.candidate.env"
-umask 077
 cat >"$candidate" <<EOF
 HERMES_IMAGE=${image}@${digest}
 HERMES_DEPLOY_ENV=${environment}
@@ -175,25 +275,153 @@ if [[ -s $current_env ]]; then
   had_current=true
   cp -p "$current_env" "$previous_env"
 fi
+candidate_published=true
 mv -f "$candidate" "$current_env"
+
+if [[ ${FAKE_PULL_INTERRUPT:-0} == 1 ]]; then
+  exit 143
+fi
 
 # Pull before replacement so a registry/network failure cannot stop the current
 # healthy container. The image reference is digest-pinned by validation above.
 # This leaves twenty minutes inside the 50-minute controller budget for replacement,
 # health verification, acceptance, evidence, and cleanup.
 pull_rc=0
+pull_started_epoch=$(date +%s)
+pull_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+pull_log=$(mktemp "$pull_attempt_dir/pull-${source_sha:0:12}-XXXXXXXX.log")
+pull_attempt_id=$(basename "$pull_log" .log)
+pull_result=success
 timeout --signal=TERM --kill-after=10s 1800s docker compose \
   --project-name "hermes-$environment" \
   --env-file "$runtime_env" \
   --env-file "$current_env" \
   -f "$compose_file" \
-  pull gateway || pull_rc=$?
+  pull gateway >"$pull_log" 2>&1 || pull_rc=$?
+cat "$pull_log" >&2
+# bound individual evidence size: keep the most recent 4 MiB of pull output
+log_size=$(stat -c '%s' -- "$pull_log")
+if (( log_size > 4194304 )); then
+  tail -c 4194304 -- "$pull_log" > "$pull_log.tail"
+  mv -f "$pull_log.tail" "$pull_log"
+fi
+pull_finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+pull_duration_seconds=$(( $(date +%s) - pull_started_epoch ))
+if (( pull_rc == 124 || pull_rc == 137 )); then
+  pull_result=pull-timeout
+elif (( pull_rc != 0 )); then
+  pull_result=pull-failed
+fi
+diagnostic_rc=0
+python3 - "$pull_attempt_dir/${pull_attempt_id}.json" "$environment" "$source_sha" \
+  "$digest" "$pull_result" "$pull_rc" "$pull_started_at" "$pull_finished_at" \
+  "$pull_duration_seconds" "$(basename "$pull_log")" <<'PY' || diagnostic_rc=$?
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if os.environ.get("FAKE_PULL_DIAGNOSTIC_FAIL") == "1":
+    raise OSError("simulated pull diagnostic failure")
+payload = {
+    "schema_version": 1,
+    "environment": sys.argv[2],
+    "source_sha": sys.argv[3],
+    "image_digest": sys.argv[4],
+    "result": sys.argv[5],
+    "exit_code": int(sys.argv[6]),
+    "started_at": sys.argv[7],
+    "finished_at": sys.argv[8],
+    "duration_seconds": int(sys.argv[9]),
+    "log_file": sys.argv[10],
+}
+temporary = path.with_suffix(".json.tmp")
+temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+os.chmod(temporary, 0o600)
+os.replace(temporary, path)
+PY
+if (( diagnostic_rc != 0 )); then
+  restore_release_atomically
+  rm -f "$pull_log" "$pull_attempt_dir/${pull_attempt_id}.json.tmp"
+  die "pull diagnostics failed; current release was left untouched"
+fi
+# Retain only the twenty newest complete attempts. Metadata is published after
+# the log, so a missing JSON sidecar is never accepted as a complete record.
+retention_rc=0
+HERMES_PULL_ATTEMPT_ID="$pull_attempt_id" python3 - "$pull_attempt_dir" <<'PY' || retention_rc=$?
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+if __import__("os").environ.get("FAKE_PULL_RETENTION_FAIL") == "1":
+    raise OSError("simulated retention failure")
+import os
+import shutil
+import stat as stat_module
+
+complete = []
+for entry in root.iterdir():
+    if entry.name.startswith("pull-") and entry.name.endswith(".json"):
+        meta = entry.lstat()
+        if not stat_module.S_ISREG(meta.st_mode):
+            stray_log = entry.with_suffix(".log")
+            if stray_log.is_dir() and not stray_log.is_symlink():
+                shutil.rmtree(stray_log)
+            else:
+                stray_log.unlink(missing_ok=True)
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink(missing_ok=True)
+            continue
+        log = entry.with_suffix(".log")
+        try:
+            log_meta = log.lstat()
+        except (FileNotFoundError, OSError):
+            entry.unlink(missing_ok=True)
+            continue
+        if not stat_module.S_ISREG(log_meta.st_mode):
+            if log.is_dir() and not log.is_symlink():
+                shutil.rmtree(log)
+            else:
+                log.unlink(missing_ok=True)
+            entry.unlink(missing_ok=True)
+            continue
+        complete.append((meta.st_mtime_ns, entry))
+complete.sort(reverse=True)
+# evict oldest first, but never the attempt this invocation just published;
+# when the current attempt is not among the newest twenty, keep it by evicting
+# one additional oldest record so the bound stays at twenty-one pairs
+current_stem = os.environ.get("HERMES_PULL_ATTEMPT_ID", "")
+current_in_newest = any(record.stem == current_stem for _, record in complete[:20])
+if current_in_newest:
+    doomed = complete[20:]
+else:
+    # protect the current attempt but keep the strict 20-pair bound by
+    # additionally evicting the oldest remaining record
+    protected = {item[1].stem for item in complete[20:] if item[1].stem == current_stem}
+    doomed = [item for item in complete if item[1].stem not in protected]
+    doomed = [item for item in doomed if item[1].stem != current_stem]
+    doomed = doomed[19:]
+for _, record in doomed:
+    if record.is_dir() and not record.is_symlink():
+        shutil.rmtree(record)
+    else:
+        record.unlink(missing_ok=True)
+    log = record.with_suffix(".log")
+    if log.is_dir() and not log.is_symlink():
+        shutil.rmtree(log)
+    else:
+        log.unlink(missing_ok=True)
+PY
+if (( retention_rc != 0 )); then
+  restore_release_atomically
+  rm -f "$pull_log" "$pull_attempt_dir/${pull_attempt_id}.json" "$pull_attempt_dir/${pull_attempt_id}.json.tmp"
+  die "pull evidence retention failed; current release was left untouched"
+fi
 if (( pull_rc != 0 )); then
-  if [[ $had_current == true ]]; then
-    cp -p "$previous_env" "$current_env"
-  else
-    rm -f "$current_env"
-  fi
+  restore_release_atomically
   if (( pull_rc == 124 || pull_rc == 137 )); then
     record_evidence pull-timeout "$digest"
     die "image pull timed out; current release was left untouched"
@@ -211,6 +439,8 @@ if verify_release; then
     --source-sha "$source_sha" \
     --deploy-root "$deploy_root"; then
     record_evidence deployed "$digest"
+    candidate_published=false
+    trap - EXIT INT TERM HUP
     printf 'Deployment complete: environment=%s source=%s digest=%s\n' \
       "$environment" "$source_sha" "$digest"
     exit 0
@@ -220,7 +450,7 @@ fi
 
 record_evidence "$failure_result" "$digest"
 if [[ $had_current == true ]]; then
-  cp -p "$previous_env" "$current_env"
+  restore_release_atomically
   if verify_release; then
     recovered_digest=$(sed -n 's/^HERMES_IMAGE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$current_env")
     record_evidence automatic-rollback "$recovered_digest"

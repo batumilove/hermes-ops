@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import json
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,10 @@ fi
 if [[ ${1:-} == exec ]]; then
   echo 'up (pid 1234) 1 seconds'
   exit 0
+fi
+if [[ ${FAKE_DOCKER_PULL_EXIT:-0} != 0 && $* == *'pull gateway'* ]]; then
+  echo "simulated pull failure" >&2
+  exit "$FAKE_DOCKER_PULL_EXIT"
 fi
 exit 0
 """
@@ -215,6 +220,155 @@ def test_pull_timeout_restores_previous_release_without_replacing_container(
     timeout_log = (root / "timeout.log").read_text()
     assert "1800s " in timeout_log
     assert "pull gateway" in timeout_log
+
+    diagnostics = sorted((root / "releases" / "pull-attempts").glob("*.json"))
+    assert len(diagnostics) == 2
+    payload = next(
+        candidate
+        for path in diagnostics
+        if (candidate := json.loads(path.read_text(encoding="utf-8")))["image_digest"]
+        == DIGEST_TWO
+    )
+    assert payload["schema_version"] == 1
+    assert payload["environment"] == "staging"
+    assert payload["source_sha"] == SHA
+    assert payload["image_digest"] == DIGEST_TWO
+    assert payload["result"] == "pull-timeout"
+    assert payload["exit_code"] == 124
+    assert payload["duration_seconds"] >= 0
+    assert payload["log_file"].endswith(".log")
+    log_path = root / "releases" / "pull-attempts" / Path(payload["log_file"]).name
+    assert log_path.exists()
+
+
+def test_pull_failure_persists_diagnostics_without_replacing_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+    assert first.returncode == 0, first.stderr
+    monkeypatch.setenv("FAKE_DOCKER_PULL_EXIT", "23")
+
+    failed = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_TWO, SHA)
+
+    assert failed.returncode != 0
+    assert "image pull failed" in failed.stderr
+    assert DIGEST_ONE in (root / "release.env").read_text()
+    history = (root / "releases" / "history.tsv").read_text()
+    assert "\tpull-failed\tstaging\t" in history
+    diagnostics = sorted((root / "releases" / "pull-attempts").glob("*.json"))
+    assert len(diagnostics) == 2
+    payload = next(
+        candidate
+        for path in diagnostics
+        if (candidate := json.loads(path.read_text(encoding="utf-8")))["image_digest"]
+        == DIGEST_TWO
+    )
+    assert payload["result"] == "pull-failed"
+    assert payload["exit_code"] == 23
+
+
+def test_diagnostic_write_failure_restores_previous_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+    assert first.returncode == 0, first.stderr
+    monkeypatch.setenv("FAKE_PULL_DIAGNOSTIC_FAIL", "1")
+
+    failed = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_TWO, SHA)
+
+    assert failed.returncode != 0
+    assert "pull diagnostics failed" in failed.stderr
+    assert DIGEST_ONE in (root / "release.env").read_text()
+    log = (root / "docker.log").read_text()
+    assert log.count("up -d --wait --wait-timeout 300 --remove-orphans") == 1
+
+
+def test_repeated_source_creates_unique_bounded_pull_evidence(tmp_path: Path) -> None:
+    root, bin_dir = _prepare(tmp_path)
+
+    for _ in range(2):
+        result = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+        assert result.returncode == 0, result.stderr
+
+    evidence = root / "releases" / "pull-attempts"
+    diagnostics = sorted(evidence.glob("*.json"))
+    logs = sorted(evidence.glob("*.log"))
+    assert len(diagnostics) == 2
+    assert len(logs) == 2
+    assert {path.stem for path in diagnostics} == {path.stem for path in logs}
+    assert all(path.stat().st_mode & 0o077 == 0 for path in diagnostics + logs)
+
+
+def test_pull_evidence_retains_only_twenty_complete_attempts(tmp_path: Path) -> None:
+    root, bin_dir = _prepare(tmp_path)
+
+    for _ in range(22):
+        result = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+        assert result.returncode == 0, result.stderr
+
+    evidence = root / "releases" / "pull-attempts"
+    assert len(list(evidence.glob("*.json"))) == 20
+    assert len(list(evidence.glob("*.log"))) == 20
+
+
+def test_unsafe_pull_evidence_directory_blocks_before_release_change(tmp_path: Path) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+    assert first.returncode == 0, first.stderr
+    evidence = root / "releases" / "pull-attempts"
+    evidence.chmod(0o755)
+
+    failed = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_TWO, SHA)
+
+    assert failed.returncode != 0
+    assert "private directory" in failed.stderr
+    assert DIGEST_ONE in (root / "release.env").read_text()
+
+
+def test_orphan_pull_artifacts_are_pruned(tmp_path: Path) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    evidence = root / "releases" / "pull-attempts"
+    evidence.mkdir(parents=True, mode=0o700)
+    (evidence / "pull-orphan.log").write_text("partial", encoding="utf-8")
+    (evidence / "pull-orphan.json.tmp").write_text("partial", encoding="utf-8")
+    (evidence / "pull-missing-log.json").write_text("{}", encoding="utf-8")
+
+    result = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+
+    assert result.returncode == 0, result.stderr
+    assert not (evidence / "pull-orphan.log").exists()
+    assert not (evidence / "pull-orphan.json.tmp").exists()
+    assert not (evidence / "pull-missing-log.json").exists()
+
+
+def test_interruption_after_candidate_publication_restores_previous_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+    assert first.returncode == 0, first.stderr
+    monkeypatch.setenv("FAKE_PULL_INTERRUPT", "1")
+
+    failed = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_TWO, SHA)
+
+    assert failed.returncode != 0
+    assert DIGEST_ONE in (root / "release.env").read_text()
+
+
+def test_retention_failure_restores_previous_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+    assert first.returncode == 0, first.stderr
+    monkeypatch.setenv("FAKE_PULL_RETENTION_FAIL", "1")
+
+    failed = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_TWO, SHA)
+
+    assert failed.returncode != 0
+    assert DIGEST_ONE in (root / "release.env").read_text()
 
 
 def test_failed_health_check_restores_previous_release(tmp_path: Path) -> None:
