@@ -386,12 +386,15 @@ for entry in root.iterdir():
         complete.append((meta.st_mtime_ns, entry))
 complete.sort(reverse=True)
 # evict oldest first, but never the attempt this invocation just published;
-# when the current attempt sits outside the newest twenty, evict additional
-# oldest records so the directory stays bounded at twenty pairs
+# when the current attempt is not among the newest twenty, keep it by evicting
+# one additional oldest record so the bound stays at twenty-one pairs
 current_stem = os.environ.get("HERMES_PULL_ATTEMPT_ID", "")
-current_in_tail = any(record.stem == current_stem for _, record in complete[20:])
-limit = 21 if current_in_tail else 20
-for _, record in complete[limit:]:
+current_in_newest = any(record.stem == current_stem for _, record in complete[:20])
+if current_in_newest:
+    doomed = complete[20:]
+else:
+    doomed = [item for item in complete[20:] if item[1].stem != current_stem]
+for _, record in doomed:
     if record.is_dir() and not record.is_symlink():
         shutil.rmtree(record)
     else:
