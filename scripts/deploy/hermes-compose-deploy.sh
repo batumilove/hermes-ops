@@ -231,10 +231,10 @@ if [[ $operation == rollback ]]; then
   rollback_from="$deploy_root/release.rollback-from.env"
   cp -p "$current_env" "$rollback_from"
   cp -p "$previous_env" "$current_env.rollback"
-  mv -f "$current_env.rollback" "$current_env"
   had_current=true
+  rollback_saved_env="$rollback_from"
   candidate_published=true
-  previous_env_saved="$rollback_from"
+  mv -f "$current_env.rollback" "$current_env"
   if verify_release; then
     cp -p "$rollback_from" "$previous_env.swap"
     mv -f "$previous_env.swap" "$previous_env"
@@ -248,14 +248,18 @@ if [[ $operation == rollback ]]; then
     printf 'Rollback complete: environment=%s digest=%s\n' "$environment" "$deployed_digest"
     exit 0
   fi
-  previous_env="$rollback_from"
+  previous_env="$rollback_saved_env"
   record_evidence rollback-failed unknown
   candidate_published=false
   restore_release_atomically
-  verify_release || true
+  if verify_release; then
+    rm -f "$rollback_from"
+    trap - EXIT INT TERM HUP
+    die "rollback candidate failed health verification; original release was restored"
+  fi
   rm -f "$rollback_from"
   trap - EXIT INT TERM HUP
-  die "rollback candidate failed health verification; original release was restored"
+  die "rollback candidate failed health verification; automatic restore also failed verification"
 fi
 
 candidate="$deploy_root/release.candidate.env"
