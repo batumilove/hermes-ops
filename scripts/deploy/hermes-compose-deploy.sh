@@ -400,8 +400,10 @@ if current_in_newest:
 else:
     # protect the current attempt but keep the strict 20-pair bound by
     # additionally evicting the oldest remaining record
-    doomed = [item for item in complete[20:] if item[1].stem != current_stem]
-    doomed.append(complete[0])
+    protected = {item[1].stem for item in complete[20:] if item[1].stem == current_stem}
+    doomed = [item for item in complete if item[1].stem not in protected]
+    doomed = [item for item in doomed if item[1].stem != current_stem]
+    doomed = doomed[19:]
 for _, record in doomed:
     if record.is_dir() and not record.is_symlink():
         shutil.rmtree(record)
