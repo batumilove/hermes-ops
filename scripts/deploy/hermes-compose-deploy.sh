@@ -43,6 +43,8 @@ asset_root=$7
 [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || die "image digest must be sha256:<64 lowercase hex characters>"
 
 mkdir -p "$deploy_root/releases"
+pull_attempt_dir="$deploy_root/releases/pull-attempts"
+mkdir -p "$pull_attempt_dir"
 compose_file="$asset_root/compose.yml"
 runtime_env="$deploy_root/runtime.env"
 current_env="$deploy_root/release.env"
@@ -182,12 +184,50 @@ mv -f "$candidate" "$current_env"
 # This leaves twenty minutes inside the 50-minute controller budget for replacement,
 # health verification, acceptance, evidence, and cleanup.
 pull_rc=0
+pull_started_epoch=$(date +%s)
+pull_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+pull_attempt_id="${pull_started_at//[:]/-}-${source_sha:0:12}"
+pull_log="$pull_attempt_dir/${pull_attempt_id}.log"
+pull_result=success
 timeout --signal=TERM --kill-after=10s 1800s docker compose \
   --project-name "hermes-$environment" \
   --env-file "$runtime_env" \
   --env-file "$current_env" \
   -f "$compose_file" \
-  pull gateway || pull_rc=$?
+  pull gateway > >(tee "$pull_log") 2> >(tee -a "$pull_log" >&2) || pull_rc=$?
+pull_finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+pull_duration_seconds=$(( $(date +%s) - pull_started_epoch ))
+if (( pull_rc == 124 || pull_rc == 137 )); then
+  pull_result=pull-timeout
+elif (( pull_rc != 0 )); then
+  pull_result=pull-failed
+fi
+python3 - "$pull_attempt_dir/${pull_attempt_id}.json" "$environment" "$source_sha" \
+  "$digest" "$pull_result" "$pull_rc" "$pull_started_at" "$pull_finished_at" \
+  "$pull_duration_seconds" "$(basename "$pull_log")" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = {
+    "schema_version": 1,
+    "environment": sys.argv[2],
+    "source_sha": sys.argv[3],
+    "image_digest": sys.argv[4],
+    "result": sys.argv[5],
+    "exit_code": int(sys.argv[6]),
+    "started_at": sys.argv[7],
+    "finished_at": sys.argv[8],
+    "duration_seconds": int(sys.argv[9]),
+    "log_file": sys.argv[10],
+}
+temporary = path.with_suffix(".json.tmp")
+temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+os.chmod(temporary, 0o600)
+os.replace(temporary, path)
+PY
 if (( pull_rc != 0 )); then
   if [[ $had_current == true ]]; then
     cp -p "$previous_env" "$current_env"

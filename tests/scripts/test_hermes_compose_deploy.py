@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import json
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,10 @@ fi
 if [[ ${1:-} == exec ]]; then
   echo 'up (pid 1234) 1 seconds'
   exit 0
+fi
+if [[ ${FAKE_DOCKER_PULL_EXIT:-0} != 0 && $* == *'pull gateway'* ]]; then
+  echo "simulated pull failure" >&2
+  exit "$FAKE_DOCKER_PULL_EXIT"
 fi
 exit 0
 """
@@ -215,6 +220,42 @@ def test_pull_timeout_restores_previous_release_without_replacing_container(
     timeout_log = (root / "timeout.log").read_text()
     assert "1800s " in timeout_log
     assert "pull gateway" in timeout_log
+
+    diagnostics = sorted((root / "releases" / "pull-attempts").glob("*.json"))
+    assert len(diagnostics) == 1
+    payload = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["environment"] == "staging"
+    assert payload["source_sha"] == SHA
+    assert payload["image_digest"] == DIGEST_TWO
+    assert payload["result"] == "pull-timeout"
+    assert payload["exit_code"] == 124
+    assert payload["duration_seconds"] >= 0
+    assert payload["log_file"].endswith(".log")
+    log_path = root / "releases" / "pull-attempts" / Path(payload["log_file"]).name
+    assert log_path.exists()
+
+
+def test_pull_failure_persists_diagnostics_without_replacing_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+    assert first.returncode == 0, first.stderr
+    monkeypatch.setenv("FAKE_DOCKER_PULL_EXIT", "23")
+
+    failed = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_TWO, SHA)
+
+    assert failed.returncode != 0
+    assert "image pull failed" in failed.stderr
+    assert DIGEST_ONE in (root / "release.env").read_text()
+    history = (root / "releases" / "history.tsv").read_text()
+    assert "\tpull-failed\tstaging\t" in history
+    diagnostics = sorted((root / "releases" / "pull-attempts").glob("*.json"))
+    assert len(diagnostics) == 1
+    payload = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+    assert payload["result"] == "pull-failed"
+    assert payload["exit_code"] == 23
 
 
 def test_failed_health_check_restores_previous_release(tmp_path: Path) -> None:
