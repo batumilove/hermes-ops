@@ -48,11 +48,13 @@ pull_attempt_dir="$deploy_root/releases/pull-attempts"
 mkdir -p "$pull_attempt_dir"
 [[ -d $pull_attempt_dir && ! -L $pull_attempt_dir && $(stat -c '%u:%a' -- "$pull_attempt_dir") == "$EUID:700" ]] || \
   die "$pull_attempt_dir must be a private directory owned by the deployment controller"
+[[ ! -L $deploy_root && -d $deploy_root ]] || die "deployment root must be a real directory"
 compose_file="$asset_root/compose.yml"
 runtime_env="$deploy_root/runtime.env"
 current_env="$deploy_root/release.env"
 previous_env="$deploy_root/release.previous.env"
 history_file="$deploy_root/releases/history.tsv"
+[[ ! -e $history_file || -f $history_file ]] || die "$history_file must be a regular file if present"
 acceptance_helper="$asset_root/verify-running-stack.py"
 lock_file="$deploy_root/deploy.lock"
 shared_staging_lock=/run/lock/hermes-staging-diagnostic.lock
@@ -119,11 +121,11 @@ find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.json.tmp' -delete
 while IFS= read -r -d '' orphan_log; do
   counterpart=${orphan_log%.log}.json
   [[ -f $counterpart && ! -L $counterpart ]] || rm -f -- "$orphan_log"
-done < <(find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.log' -print0)
+done < <(find "$pull_attempt_dir" -maxdepth 1 -name 'pull-*.log' -print0)
 while IFS= read -r -d '' orphan_json; do
   counterpart=${orphan_json%.json}.log
   [[ -f $counterpart && ! -L $counterpart ]] || rm -f -- "$orphan_json"
-done < <(find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.json' -print0)
+done < <(find "$pull_attempt_dir" -maxdepth 1 -name 'pull-*.json' -print0)
 
 compose() {
   docker compose \
@@ -299,6 +301,7 @@ root = pathlib.Path(sys.argv[1])
 if __import__("os").environ.get("FAKE_PULL_RETENTION_FAIL") == "1":
     raise OSError("simulated retention failure")
 import os
+import shutil
 import stat as stat_module
 
 complete = []
@@ -306,7 +309,10 @@ for entry in root.iterdir():
     if entry.name.startswith("pull-") and entry.name.endswith(".json"):
         meta = entry.lstat()
         if not stat_module.S_ISREG(meta.st_mode):
-            entry.unlink(missing_ok=True)
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink(missing_ok=True)
             continue
         log = entry.with_suffix(".log")
         try:
@@ -315,14 +321,26 @@ for entry in root.iterdir():
             entry.unlink(missing_ok=True)
             continue
         if not stat_module.S_ISREG(log_meta.st_mode):
+            if log.is_dir() and not log.is_symlink():
+                shutil.rmtree(log)
+            else:
+                log.unlink(missing_ok=True)
             entry.unlink(missing_ok=True)
-            log.unlink(missing_ok=True)
             continue
         complete.append((meta.st_mtime_ns, entry))
 complete.sort(reverse=True)
+import shutil
+
 for _, record in complete[20:]:
-    record.unlink(missing_ok=True)
-    record.with_suffix(".log").unlink(missing_ok=True)
+    if record.is_dir() and not record.is_symlink():
+        shutil.rmtree(record)
+    else:
+        record.unlink(missing_ok=True)
+    log = record.with_suffix(".log")
+    if log.is_dir() and not log.is_symlink():
+        shutil.rmtree(log)
+    else:
+        log.unlink(missing_ok=True)
 PY
 if (( pull_rc != 0 )); then
   restore_release_atomically
@@ -343,8 +361,8 @@ if verify_release; then
     --source-sha "$source_sha" \
     --deploy-root "$deploy_root"; then
     candidate_published=false
-    trap - EXIT INT TERM HUP
     record_evidence deployed "$digest"
+    trap - EXIT INT TERM HUP
     printf 'Deployment complete: environment=%s source=%s digest=%s\n' \
       "$environment" "$source_sha" "$digest"
     exit 0
