@@ -22,6 +22,7 @@ EOF
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
+  trap - EXIT INT TERM HUP
   exit 1
 }
 
@@ -43,6 +44,12 @@ asset_root=$7
 [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || die "image digest must be sha256:<64 lowercase hex characters>"
 
 umask 077
+[[ ! -L $deploy_root && -d $deploy_root ]] || die "deployment root must be a real directory"
+releases_dir="$deploy_root/releases"
+if [[ -e $releases_dir && ! -d $releases_dir ]]; then
+  die "$releases_dir must be a directory if present"
+fi
+[[ -e $releases_dir && -L $releases_dir ]] && die "$releases_dir must not be a symlink"
 mkdir -p "$deploy_root/releases"
 pull_attempt_dir="$deploy_root/releases/pull-attempts"
 mkdir -p "$pull_attempt_dir"
@@ -116,16 +123,38 @@ flock -w 300 9 || die "timed out waiting for deployment lock"
 
 # Cleanup is serialized by the deployment lock so it cannot race an active
 # pull whose log exists before its final JSON sidecar.
-find "$pull_attempt_dir" -maxdepth 1 \( -name 'pull-*.json.tmp' -o -name 'pull-*.json' -o -name 'pull-*.log' \) -type l -delete
-find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.json.tmp' -delete
-while IFS= read -r -d '' orphan_log; do
-  counterpart=${orphan_log%.log}.json
-  [[ -f $counterpart && ! -L $counterpart ]] || rm -f -- "$orphan_log"
-done < <(find "$pull_attempt_dir" -maxdepth 1 -name 'pull-*.log' -print0)
-while IFS= read -r -d '' orphan_json; do
-  counterpart=${orphan_json%.json}.log
-  [[ -f $counterpart && ! -L $counterpart ]] || rm -f -- "$orphan_json"
-done < <(find "$pull_attempt_dir" -maxdepth 1 -name 'pull-*.json' -print0)
+python3 - "$pull_attempt_dir" <<'PY'
+import pathlib
+import shutil
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for entry in root.iterdir():
+    if not (entry.name.startswith("pull-") and (entry.name.endswith(".json") or entry.name.endswith(".log") or entry.name.endswith(".json.tmp"))):
+        continue
+    # remove only non-regular entries and temporary files; complete pairs are
+    # decided below against their counterpart
+    if entry.name.endswith(".json.tmp") or entry.is_symlink():
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink(missing_ok=True)
+
+# keep only entries that are members of a complete regular-file pair
+logs = {entry for entry in root.iterdir() if entry.name.startswith("pull-") and entry.name.endswith(".log")}
+jsons = {entry for entry in root.iterdir() if entry.name.startswith("pull-") and entry.name.endswith(".json")}
+for log in logs:
+    meta = log.with_suffix(".json")
+    if meta not in jsons:
+        log.unlink(missing_ok=True)
+        jsons.discard(log.with_suffix(".json"))
+for meta in list(jsons):
+    log = meta.with_suffix(".log")
+    if log not in logs:
+        meta.unlink(missing_ok=True)
+        jsons.discard(meta)
+PY
 
 compose() {
   docker compose \
@@ -317,7 +346,7 @@ for entry in root.iterdir():
         log = entry.with_suffix(".log")
         try:
             log_meta = log.lstat()
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             entry.unlink(missing_ok=True)
             continue
         if not stat_module.S_ISREG(log_meta.st_mode):
@@ -329,8 +358,6 @@ for entry in root.iterdir():
             continue
         complete.append((meta.st_mtime_ns, entry))
 complete.sort(reverse=True)
-import shutil
-
 for _, record in complete[20:]:
     if record.is_dir() and not record.is_symlink():
         shutil.rmtree(record)
