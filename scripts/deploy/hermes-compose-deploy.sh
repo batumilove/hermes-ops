@@ -196,7 +196,8 @@ restore_candidate_release() {
   local rc=$?
   if [[ ${candidate_published:-false} == true ]]; then
     if [[ $had_current == true ]]; then
-      cp -p "$previous_env" "$current_env"
+      cp -p "$previous_env" "$current_env.restore"
+      mv -f "$current_env.restore" "$current_env"
     else
       rm -f "$current_env"
     fi
@@ -318,9 +319,9 @@ if verify_release; then
     --digest "$digest" \
     --source-sha "$source_sha" \
     --deploy-root "$deploy_root"; then
-    record_evidence deployed "$digest"
     candidate_published=false
     trap - EXIT INT TERM HUP
+    record_evidence deployed "$digest"
     printf 'Deployment complete: environment=%s source=%s digest=%s\n' \
       "$environment" "$source_sha" "$digest"
     exit 0
