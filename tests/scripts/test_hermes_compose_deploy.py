@@ -301,6 +301,46 @@ def test_repeated_source_creates_unique_bounded_pull_evidence(tmp_path: Path) ->
     assert all(path.stat().st_mode & 0o077 == 0 for path in diagnostics + logs)
 
 
+def test_pull_evidence_retains_only_twenty_complete_attempts(tmp_path: Path) -> None:
+    root, bin_dir = _prepare(tmp_path)
+
+    for _ in range(22):
+        result = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+        assert result.returncode == 0, result.stderr
+
+    evidence = root / "releases" / "pull-attempts"
+    assert len(list(evidence.glob("*.json"))) == 20
+    assert len(list(evidence.glob("*.log"))) == 20
+
+
+def test_unsafe_pull_evidence_directory_blocks_before_release_change(tmp_path: Path) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+    assert first.returncode == 0, first.stderr
+    evidence = root / "releases" / "pull-attempts"
+    evidence.chmod(0o755)
+
+    failed = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_TWO, SHA)
+
+    assert failed.returncode != 0
+    assert "private directory" in failed.stderr
+    assert DIGEST_ONE in (root / "release.env").read_text()
+
+
+def test_orphan_pull_artifacts_are_pruned(tmp_path: Path) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    evidence = root / "releases" / "pull-attempts"
+    evidence.mkdir(parents=True, mode=0o700)
+    (evidence / "pull-orphan.log").write_text("partial", encoding="utf-8")
+    (evidence / "pull-orphan.json.tmp").write_text("partial", encoding="utf-8")
+
+    result = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+
+    assert result.returncode == 0, result.stderr
+    assert not (evidence / "pull-orphan.log").exists()
+    assert not (evidence / "pull-orphan.json.tmp").exists()
+
+
 def test_failed_health_check_restores_previous_release(tmp_path: Path) -> None:
     root, bin_dir = _prepare(tmp_path)
     first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)

@@ -48,6 +48,12 @@ pull_attempt_dir="$deploy_root/releases/pull-attempts"
 mkdir -p "$pull_attempt_dir"
 [[ -d $pull_attempt_dir && ! -L $pull_attempt_dir && $(stat -c '%u:%a' -- "$pull_attempt_dir") == "$EUID:700" ]] || \
   die "$pull_attempt_dir must be a private directory owned by the deployment controller"
+# Remove only incomplete artifacts from interrupted attempts. Complete records
+# always have both the final JSON sidecar and its named log.
+find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.json.tmp' -delete
+while IFS= read -r -d '' orphan_log; do
+  [[ -e ${orphan_log%.log}.json ]] || rm -f -- "$orphan_log"
+done < <(find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.log' -print0)
 compose_file="$asset_root/compose.yml"
 runtime_env="$deploy_root/runtime.env"
 current_env="$deploy_root/release.env"
