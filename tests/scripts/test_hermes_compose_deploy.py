@@ -222,8 +222,13 @@ def test_pull_timeout_restores_previous_release_without_replacing_container(
     assert "pull gateway" in timeout_log
 
     diagnostics = sorted((root / "releases" / "pull-attempts").glob("*.json"))
-    assert len(diagnostics) == 1
-    payload = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+    assert len(diagnostics) == 2
+    payload = next(
+        candidate
+        for path in diagnostics
+        if (candidate := json.loads(path.read_text(encoding="utf-8")))["image_digest"]
+        == DIGEST_TWO
+    )
     assert payload["schema_version"] == 1
     assert payload["environment"] == "staging"
     assert payload["source_sha"] == SHA
@@ -252,10 +257,48 @@ def test_pull_failure_persists_diagnostics_without_replacing_container(
     history = (root / "releases" / "history.tsv").read_text()
     assert "\tpull-failed\tstaging\t" in history
     diagnostics = sorted((root / "releases" / "pull-attempts").glob("*.json"))
-    assert len(diagnostics) == 1
-    payload = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+    assert len(diagnostics) == 2
+    payload = next(
+        candidate
+        for path in diagnostics
+        if (candidate := json.loads(path.read_text(encoding="utf-8")))["image_digest"]
+        == DIGEST_TWO
+    )
     assert payload["result"] == "pull-failed"
     assert payload["exit_code"] == 23
+
+
+def test_diagnostic_write_failure_restores_previous_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+    assert first.returncode == 0, first.stderr
+    monkeypatch.setenv("FAKE_PULL_DIAGNOSTIC_FAIL", "1")
+
+    failed = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_TWO, SHA)
+
+    assert failed.returncode != 0
+    assert "pull diagnostics failed" in failed.stderr
+    assert DIGEST_ONE in (root / "release.env").read_text()
+    log = (root / "docker.log").read_text()
+    assert log.count("up -d --wait --wait-timeout 300 --remove-orphans") == 1
+
+
+def test_repeated_source_creates_unique_bounded_pull_evidence(tmp_path: Path) -> None:
+    root, bin_dir = _prepare(tmp_path)
+
+    for _ in range(2):
+        result = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+        assert result.returncode == 0, result.stderr
+
+    evidence = root / "releases" / "pull-attempts"
+    diagnostics = sorted(evidence.glob("*.json"))
+    logs = sorted(evidence.glob("*.log"))
+    assert len(diagnostics) == 2
+    assert len(logs) == 2
+    assert {path.stem for path in diagnostics} == {path.stem for path in logs}
+    assert all(path.stat().st_mode & 0o077 == 0 for path in diagnostics + logs)
 
 
 def test_failed_health_check_restores_previous_release(tmp_path: Path) -> None:
