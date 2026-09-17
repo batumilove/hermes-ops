@@ -333,12 +333,42 @@ def test_orphan_pull_artifacts_are_pruned(tmp_path: Path) -> None:
     evidence.mkdir(parents=True, mode=0o700)
     (evidence / "pull-orphan.log").write_text("partial", encoding="utf-8")
     (evidence / "pull-orphan.json.tmp").write_text("partial", encoding="utf-8")
+    (evidence / "pull-missing-log.json").write_text("{}", encoding="utf-8")
 
     result = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
 
     assert result.returncode == 0, result.stderr
     assert not (evidence / "pull-orphan.log").exists()
     assert not (evidence / "pull-orphan.json.tmp").exists()
+    assert not (evidence / "pull-missing-log.json").exists()
+
+
+def test_interruption_after_candidate_publication_restores_previous_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+    assert first.returncode == 0, first.stderr
+    monkeypatch.setenv("FAKE_PULL_INTERRUPT", "1")
+
+    failed = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_TWO, SHA)
+
+    assert failed.returncode != 0
+    assert DIGEST_ONE in (root / "release.env").read_text()
+
+
+def test_retention_failure_restores_previous_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, bin_dir = _prepare(tmp_path)
+    first = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_ONE, SHA)
+    assert first.returncode == 0, first.stderr
+    monkeypatch.setenv("FAKE_PULL_RETENTION_FAIL", "1")
+
+    failed = _run(root, bin_dir, "deploy", "staging", IMAGE, DIGEST_TWO, SHA)
+
+    assert failed.returncode != 0
+    assert DIGEST_ONE in (root / "release.env").read_text()
 
 
 def test_failed_health_check_restores_previous_release(tmp_path: Path) -> None:

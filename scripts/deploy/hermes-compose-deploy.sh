@@ -48,12 +48,6 @@ pull_attempt_dir="$deploy_root/releases/pull-attempts"
 mkdir -p "$pull_attempt_dir"
 [[ -d $pull_attempt_dir && ! -L $pull_attempt_dir && $(stat -c '%u:%a' -- "$pull_attempt_dir") == "$EUID:700" ]] || \
   die "$pull_attempt_dir must be a private directory owned by the deployment controller"
-# Remove only incomplete artifacts from interrupted attempts. Complete records
-# always have both the final JSON sidecar and its named log.
-find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.json.tmp' -delete
-while IFS= read -r -d '' orphan_log; do
-  [[ -e ${orphan_log%.log}.json ]] || rm -f -- "$orphan_log"
-done < <(find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.log' -print0)
 compose_file="$asset_root/compose.yml"
 runtime_env="$deploy_root/runtime.env"
 current_env="$deploy_root/release.env"
@@ -117,6 +111,16 @@ else
   exec 9>"$lock_file"
 fi
 flock -w 300 9 || die "timed out waiting for deployment lock"
+
+# Cleanup is serialized by the deployment lock so it cannot race an active
+# pull whose log exists before its final JSON sidecar.
+find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.json.tmp' -delete
+while IFS= read -r -d '' orphan_log; do
+  [[ -e ${orphan_log%.log}.json ]] || rm -f -- "$orphan_log"
+done < <(find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.log' -print0)
+while IFS= read -r -d '' orphan_json; do
+  [[ -e ${orphan_json%.json}.log ]] || rm -f -- "$orphan_json"
+done < <(find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.json' -print0)
 
 compose() {
   docker compose \
@@ -186,6 +190,23 @@ if [[ -s $current_env ]]; then
   cp -p "$current_env" "$previous_env"
 fi
 mv -f "$candidate" "$current_env"
+candidate_published=true
+restore_candidate_release() {
+  local rc=$?
+  if [[ ${candidate_published:-false} == true ]]; then
+    if [[ $had_current == true ]]; then
+      cp -p "$previous_env" "$current_env"
+    else
+      rm -f "$current_env"
+    fi
+  fi
+  return "$rc"
+}
+trap restore_candidate_release EXIT INT TERM HUP
+
+if [[ ${FAKE_PULL_INTERRUPT:-0} == 1 ]]; then
+  exit 143
+fi
 
 # Pull before replacement so a registry/network failure cannot stop the current
 # healthy container. The image reference is digest-pinned by validation above.
@@ -256,10 +277,12 @@ import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
+if __import__("os").environ.get("FAKE_PULL_RETENTION_FAIL") == "1":
+    raise OSError("simulated retention failure")
 records = sorted(root.glob("pull-*.json"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
 for record in records[20:]:
-    record.with_suffix(".log").unlink(missing_ok=True)
     record.unlink(missing_ok=True)
+    record.with_suffix(".log").unlink(missing_ok=True)
 PY
 if (( pull_rc != 0 )); then
   if [[ $had_current == true ]]; then
@@ -284,6 +307,8 @@ if verify_release; then
     --source-sha "$source_sha" \
     --deploy-root "$deploy_root"; then
     record_evidence deployed "$digest"
+    candidate_published=false
+    trap - EXIT INT TERM HUP
     printf 'Deployment complete: environment=%s source=%s digest=%s\n' \
       "$environment" "$source_sha" "$digest"
     exit 0
