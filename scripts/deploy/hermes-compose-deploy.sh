@@ -200,6 +200,7 @@ if [[ $operation == rollback ]]; then
   mv -f "$current_env.rollback" "$current_env"
   had_current=true
   candidate_published=true
+  previous_env_saved="$rollback_from"
   if verify_release; then
     cp -p "$rollback_from" "$previous_env.swap"
     mv -f "$previous_env.swap" "$previous_env"
@@ -233,13 +234,13 @@ if [[ -s $current_env ]]; then
   had_current=true
   cp -p "$current_env" "$previous_env"
 fi
-candidate_published=false
 restore_candidate_release() {
   local rc=$?
   if [[ ${candidate_published:-false} == true ]]; then
     if [[ $had_current == true ]]; then
       cp -p "$previous_env" "$current_env.restore"
       mv -f "$current_env.restore" "$current_env"
+      verify_release >/dev/null 2>&1 || true
     else
       rm -f "$current_env"
     fi
@@ -380,11 +381,13 @@ for entry in root.iterdir():
             continue
         complete.append((meta.st_mtime_ns, entry))
 complete.sort(reverse=True)
-# evict oldest first, but never the attempt this invocation just published
+# evict oldest first, but never the attempt this invocation just published;
+# when the current attempt sits outside the newest twenty, evict additional
+# oldest records so the directory stays bounded at twenty pairs
 current_stem = os.environ.get("HERMES_PULL_ATTEMPT_ID", "")
-for _, record in complete[20:]:
-    if record.stem == current_stem:
-        continue
+current_in_tail = any(record.stem == current_stem for _, record in complete[20:])
+limit = 21 if current_in_tail else 20
+for _, record in complete[limit:]:
     if record.is_dir() and not record.is_symlink():
         shutil.rmtree(record)
     else:
