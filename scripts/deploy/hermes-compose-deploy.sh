@@ -188,52 +188,6 @@ record_evidence() {
     "$source_sha" "$deployed_digest" >> "$history_file"
 }
 
-if [[ $operation == rollback ]]; then
-  [[ -s $previous_env ]] || die "no previous release is available for rollback"
-  rollback_digest=$(sed -n 's/^HERMES_IMAGE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$previous_env")
-  rollback_source=$(sed -n 's/^HERMES_SOURCE_SHA=\([0-9a-f]\{40\}\)$/\1/p' "$previous_env")
-  [[ $rollback_digest == "$digest" ]] || die "rollback target digest mismatch"
-  [[ $rollback_source == "$source_sha" ]] || die "rollback target source SHA mismatch"
-  rollback_from="$deploy_root/release.rollback-from.env"
-  cp -p "$current_env" "$rollback_from"
-  cp -p "$previous_env" "$current_env.rollback"
-  mv -f "$current_env.rollback" "$current_env"
-  had_current=true
-  candidate_published=true
-  previous_env_saved="$rollback_from"
-  if verify_release; then
-    cp -p "$rollback_from" "$previous_env.swap"
-    mv -f "$previous_env.swap" "$previous_env"
-    deployed_digest=$(sed -n 's/^HERMES_IMAGE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$current_env")
-    record_evidence rollback "$deployed_digest"
-    candidate_published=false
-    cp -p "$rollback_from" "$deploy_root/release.previous.env.swap"
-    mv -f "$deploy_root/release.previous.env.swap" "$deploy_root/release.previous.env"
-    rm -f "$rollback_from"
-    printf 'Rollback complete: environment=%s digest=%s\n' "$environment" "$deployed_digest"
-    exit 0
-  fi
-  cp -p "$rollback_from" "$current_env.rollback"
-  mv -f "$current_env.rollback" "$current_env"
-  candidate_published=false
-  verify_release || true
-  rm -f "$rollback_from"
-  record_evidence rollback-failed unknown
-  die "rollback candidate failed health verification; original release was restored"
-fi
-
-candidate="$deploy_root/release.candidate.env"
-cat >"$candidate" <<EOF
-HERMES_IMAGE=${image}@${digest}
-HERMES_DEPLOY_ENV=${environment}
-HERMES_SOURCE_SHA=${source_sha}
-EOF
-
-had_current=false
-if [[ -s $current_env ]]; then
-  had_current=true
-  cp -p "$current_env" "$previous_env"
-fi
 restore_candidate_release() {
   local rc=$?
   if [[ ${candidate_published:-false} == true ]]; then
@@ -266,6 +220,56 @@ trap restore_candidate_release EXIT
 trap 'terminate_after_restore 130' INT
 trap 'terminate_after_restore 143' TERM
 trap 'terminate_after_restore 129' HUP
+
+if [[ $operation == rollback ]]; then
+  [[ -s $previous_env ]] || die "no previous release is available for rollback"
+  had_current=true
+  rollback_digest=$(sed -n 's/^HERMES_IMAGE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$previous_env")
+  rollback_source=$(sed -n 's/^HERMES_SOURCE_SHA=\([0-9a-f]\{40\}\)$/\1/p' "$previous_env")
+  [[ $rollback_digest == "$digest" ]] || die "rollback target digest mismatch"
+  [[ $rollback_source == "$source_sha" ]] || die "rollback target source SHA mismatch"
+  rollback_from="$deploy_root/release.rollback-from.env"
+  cp -p "$current_env" "$rollback_from"
+  cp -p "$previous_env" "$current_env.rollback"
+  mv -f "$current_env.rollback" "$current_env"
+  had_current=true
+  candidate_published=true
+  previous_env_saved="$rollback_from"
+  if verify_release; then
+    cp -p "$rollback_from" "$previous_env.swap"
+    mv -f "$previous_env.swap" "$previous_env"
+    deployed_digest=$(sed -n 's/^HERMES_IMAGE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$current_env")
+    record_evidence rollback "$deployed_digest"
+    candidate_published=false
+    trap - EXIT INT TERM HUP
+    cp -p "$rollback_from" "$deploy_root/release.previous.env.swap"
+    mv -f "$deploy_root/release.previous.env.swap" "$deploy_root/release.previous.env"
+    rm -f "$rollback_from"
+    printf 'Rollback complete: environment=%s digest=%s\n' "$environment" "$deployed_digest"
+    exit 0
+  fi
+  previous_env="$rollback_from"
+  record_evidence rollback-failed unknown
+  candidate_published=false
+  restore_release_atomically
+  verify_release || true
+  rm -f "$rollback_from"
+  trap - EXIT INT TERM HUP
+  die "rollback candidate failed health verification; original release was restored"
+fi
+
+candidate="$deploy_root/release.candidate.env"
+cat >"$candidate" <<EOF
+HERMES_IMAGE=${image}@${digest}
+HERMES_DEPLOY_ENV=${environment}
+HERMES_SOURCE_SHA=${source_sha}
+EOF
+
+had_current=false
+if [[ -s $current_env ]]; then
+  had_current=true
+  cp -p "$current_env" "$previous_env"
+fi
 candidate_published=true
 mv -f "$candidate" "$current_env"
 
