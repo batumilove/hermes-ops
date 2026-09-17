@@ -191,8 +191,9 @@ record_evidence() {
 restore_candidate_release() {
   local rc=$?
   if [[ ${candidate_published:-false} == true ]]; then
+    local source_env="${rollback_saved_env:-$previous_env}"
     if [[ $had_current == true ]]; then
-      cp -p "$previous_env" "$current_env.restore"
+      cp -p "$source_env" "$current_env.restore"
       mv -f "$current_env.restore" "$current_env"
       verify_release >/dev/null 2>&1 || true
     else
@@ -397,7 +398,10 @@ current_in_newest = any(record.stem == current_stem for _, record in complete[:2
 if current_in_newest:
     doomed = complete[20:]
 else:
+    # protect the current attempt but keep the strict 20-pair bound by
+    # additionally evicting the oldest remaining record
     doomed = [item for item in complete[20:] if item[1].stem != current_stem]
+    doomed.append(complete[0])
 for _, record in doomed:
     if record.is_dir() and not record.is_symlink():
         shutil.rmtree(record)
