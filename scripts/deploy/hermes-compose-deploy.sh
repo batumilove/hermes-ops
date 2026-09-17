@@ -116,10 +116,12 @@ flock -w 300 9 || die "timed out waiting for deployment lock"
 # pull whose log exists before its final JSON sidecar.
 find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.json.tmp' -delete
 while IFS= read -r -d '' orphan_log; do
-  [[ -e ${orphan_log%.log}.json ]] || rm -f -- "$orphan_log"
+  counterpart=${orphan_log%.log}.json
+  [[ -f $counterpart && ! -L $counterpart ]] || rm -f -- "$orphan_log"
 done < <(find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.log' -print0)
 while IFS= read -r -d '' orphan_json; do
-  [[ -e ${orphan_json%.json}.log ]] || rm -f -- "$orphan_json"
+  counterpart=${orphan_json%.json}.log
+  [[ -f $counterpart && ! -L $counterpart ]] || rm -f -- "$orphan_json"
 done < <(find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.json' -print0)
 
 compose() {
@@ -189,8 +191,7 @@ if [[ -s $current_env ]]; then
   had_current=true
   cp -p "$current_env" "$previous_env"
 fi
-mv -f "$candidate" "$current_env"
-candidate_published=true
+candidate_published=false
 restore_candidate_release() {
   local rc=$?
   if [[ ${candidate_published:-false} == true ]]; then
@@ -202,7 +203,18 @@ restore_candidate_release() {
   fi
   return "$rc"
 }
-trap restore_candidate_release EXIT INT TERM HUP
+terminate_after_restore() {
+  local rc=$1
+  restore_candidate_release
+  trap - EXIT INT TERM HUP
+  exit "$rc"
+}
+trap restore_candidate_release EXIT
+trap 'terminate_after_restore 130' INT
+trap 'terminate_after_restore 143' TERM
+trap 'terminate_after_restore 129' HUP
+candidate_published=true
+mv -f "$candidate" "$current_env"
 
 if [[ ${FAKE_PULL_INTERRUPT:-0} == 1 ]]; then
   exit 143
