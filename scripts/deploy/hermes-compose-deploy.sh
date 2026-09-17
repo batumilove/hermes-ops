@@ -114,6 +114,7 @@ flock -w 300 9 || die "timed out waiting for deployment lock"
 
 # Cleanup is serialized by the deployment lock so it cannot race an active
 # pull whose log exists before its final JSON sidecar.
+find "$pull_attempt_dir" -maxdepth 1 \( -name 'pull-*.json.tmp' -o -name 'pull-*.json' -o -name 'pull-*.log' \) -type l -delete
 find "$pull_attempt_dir" -maxdepth 1 -type f -name 'pull-*.json.tmp' -delete
 while IFS= read -r -d '' orphan_log; do
   counterpart=${orphan_log%.log}.json
@@ -204,6 +205,15 @@ restore_candidate_release() {
   fi
   return "$rc"
 }
+
+restore_release_atomically() {
+  if [[ $had_current == true ]]; then
+    cp -p "$previous_env" "$current_env.restore"
+    mv -f "$current_env.restore" "$current_env"
+  else
+    rm -f "$current_env"
+  fi
+}
 terminate_after_restore() {
   local rc=$1
   restore_candidate_release
@@ -275,11 +285,7 @@ os.chmod(temporary, 0o600)
 os.replace(temporary, path)
 PY
 if (( diagnostic_rc != 0 )); then
-  if [[ $had_current == true ]]; then
-    cp -p "$previous_env" "$current_env"
-  else
-    rm -f "$current_env"
-  fi
+  restore_release_atomically
   rm -f "$pull_log" "$pull_attempt_dir/${pull_attempt_id}.json.tmp"
   die "pull diagnostics failed; current release was left untouched"
 fi
@@ -292,17 +298,34 @@ import sys
 root = pathlib.Path(sys.argv[1])
 if __import__("os").environ.get("FAKE_PULL_RETENTION_FAIL") == "1":
     raise OSError("simulated retention failure")
-records = sorted(root.glob("pull-*.json"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
-for record in records[20:]:
+import os
+import stat as stat_module
+
+complete = []
+for entry in root.iterdir():
+    if entry.name.startswith("pull-") and entry.name.endswith(".json"):
+        meta = entry.lstat()
+        if not stat_module.S_ISREG(meta.st_mode):
+            entry.unlink(missing_ok=True)
+            continue
+        log = entry.with_suffix(".log")
+        try:
+            log_meta = log.lstat()
+        except FileNotFoundError:
+            entry.unlink(missing_ok=True)
+            continue
+        if not stat_module.S_ISREG(log_meta.st_mode):
+            entry.unlink(missing_ok=True)
+            log.unlink(missing_ok=True)
+            continue
+        complete.append((meta.st_mtime_ns, entry))
+complete.sort(reverse=True)
+for _, record in complete[20:]:
     record.unlink(missing_ok=True)
     record.with_suffix(".log").unlink(missing_ok=True)
 PY
 if (( pull_rc != 0 )); then
-  if [[ $had_current == true ]]; then
-    cp -p "$previous_env" "$current_env"
-  else
-    rm -f "$current_env"
-  fi
+  restore_release_atomically
   if (( pull_rc == 124 || pull_rc == 137 )); then
     record_evidence pull-timeout "$digest"
     die "image pull timed out; current release was left untouched"
