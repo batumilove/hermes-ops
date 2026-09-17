@@ -198,17 +198,23 @@ if [[ $operation == rollback ]]; then
   cp -p "$current_env" "$rollback_from"
   cp -p "$previous_env" "$current_env.rollback"
   mv -f "$current_env.rollback" "$current_env"
+  had_current=true
+  candidate_published=true
   if verify_release; then
     cp -p "$rollback_from" "$previous_env.swap"
     mv -f "$previous_env.swap" "$previous_env"
     deployed_digest=$(sed -n 's/^HERMES_IMAGE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$current_env")
     record_evidence rollback "$deployed_digest"
+    candidate_published=false
+    cp -p "$rollback_from" "$deploy_root/release.previous.env.swap"
+    mv -f "$deploy_root/release.previous.env.swap" "$deploy_root/release.previous.env"
     rm -f "$rollback_from"
     printf 'Rollback complete: environment=%s digest=%s\n' "$environment" "$deployed_digest"
     exit 0
   fi
   cp -p "$rollback_from" "$current_env.rollback"
   mv -f "$current_env.rollback" "$current_env"
+  candidate_published=false
   verify_release || true
   rm -f "$rollback_from"
   record_evidence rollback-failed unknown
@@ -283,6 +289,12 @@ timeout --signal=TERM --kill-after=10s 1800s docker compose \
   -f "$compose_file" \
   pull gateway >"$pull_log" 2>&1 || pull_rc=$?
 cat "$pull_log" >&2
+# bound individual evidence size: keep the most recent 4 MiB of pull output
+log_size=$(stat -c '%s' -- "$pull_log")
+if (( log_size > 4194304 )); then
+  tail -c 4194304 -- "$pull_log" > "$pull_log.tail"
+  mv -f "$pull_log.tail" "$pull_log"
+fi
 pull_finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 pull_duration_seconds=$(( $(date +%s) - pull_started_epoch ))
 if (( pull_rc == 124 || pull_rc == 137 )); then
@@ -327,7 +339,7 @@ fi
 # Retain only the twenty newest complete attempts. Metadata is published after
 # the log, so a missing JSON sidecar is never accepted as a complete record.
 retention_rc=0
-python3 - "$pull_attempt_dir" <<'PY' || retention_rc=$?
+HERMES_PULL_ATTEMPT_ID="$pull_attempt_id" python3 - "$pull_attempt_dir" <<'PY' || retention_rc=$?
 import pathlib
 import sys
 
@@ -368,7 +380,11 @@ for entry in root.iterdir():
             continue
         complete.append((meta.st_mtime_ns, entry))
 complete.sort(reverse=True)
+# evict oldest first, but never the attempt this invocation just published
+current_stem = os.environ.get("HERMES_PULL_ATTEMPT_ID", "")
 for _, record in complete[20:]:
+    if record.stem == current_stem:
+        continue
     if record.is_dir() and not record.is_symlink():
         shutil.rmtree(record)
     else:
