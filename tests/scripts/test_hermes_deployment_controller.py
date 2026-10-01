@@ -42,6 +42,16 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def test_controller_requires_digest_bound_retention_helper() -> None:
+    module = _load()
+
+    assert "retention" in module.EXPECTED_ARTIFACTS
+    assert module.EXPECTED_MODES["retention"] == 0o755
+    installer = INSTALLER.read_text(encoding="utf-8")
+    assert "scripts/deploy/prune_deployment_images.py" in installer
+    assert '"retention": retention' in installer
+
+
 def test_default_runner_preserves_root_docker_auth_home(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _load()
     observed: dict[str, object] = {}
@@ -131,11 +141,11 @@ def _fixture(tmp_path: Path, runner=None):
     assets = tmp_path / "assets"
     assets.mkdir()
     artifact_paths = {}
-    for name in ("controller", "deployer", "compose", "acceptance", "installer", "sudoers"):
+    for name in ("controller", "deployer", "compose", "acceptance", "retention", "installer", "sudoers"):
         path = assets / name
         path.write_text(f"reviewed-{name}\n", encoding="utf-8")
         path.chmod(
-            0o755 if name in {"controller", "deployer", "acceptance", "installer"}
+            0o755 if name in {"controller", "deployer", "acceptance", "retention", "installer"}
             else 0o600 if name == "sudoers"
             else 0o644
         )
@@ -447,7 +457,7 @@ def test_emergency_clear_is_root_only_separate_and_audited(tmp_path: Path) -> No
     assert event["authorization"] == "root-console"
 
 
-@pytest.mark.parametrize("artifact", ["deployer", "compose", "acceptance"])
+@pytest.mark.parametrize("artifact", ["deployer", "compose", "acceptance", "retention"])
 def test_tampered_root_owned_artifact_blocks_before_deployer(
     tmp_path: Path, artifact: str
 ) -> None:
