@@ -100,6 +100,8 @@ jobs:
         with:
           ref: ${{ inputs.source_sha }}
           path: source
+          fetch-depth: 0
+          filter: blob:none
           persist-credentials: false
       - name: Check out exact operational tooling
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -152,6 +154,19 @@ jobs:
             --source-uri "$EXPECTED_SOURCE_URI"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Prepare authenticated image identity
+        if: steps.resolve.outputs.exists == 'false'
+        working-directory: source
+        env:
+          EXPECTED_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git fetch --filter=blob:none --no-tags \
+            https://github.com/NousResearch/hermes-agent.git \
+            refs/tags/v2026.9.24
+          python3 -m scripts.build.image_identity \
+            --repo . --stamp install-stamp.json
       - name: Build and publish immutable image
         id: build
         if: steps.resolve.outputs.exists == 'false'

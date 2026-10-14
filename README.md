@@ -12,6 +12,12 @@ The application fork invokes workflows from this repository by full commit
 SHA. Deployment callers must also pass the same reviewed `ops_sha`; the
 workflow checks out no moving branch before it transfers or executes tooling.
 
+Image publication prepares the application's install stamp before Docker removes
+Git from the build context. The application's image-identity helper authenticates
+the pinned release object and accepted fork import, then records a source package
+version bound to the exact caller SHA. Both package metadata and the image marker
+consume that version; development placeholders remain unchanged in source manifests.
+
 The deployment script records the source SHA and immutable image digest, and
 promotes an already-built digest. Rollback restores both the previous release
 environment and its digest without rebuilding.
