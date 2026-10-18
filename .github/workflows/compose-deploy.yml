@@ -78,6 +78,18 @@ jobs:
           tags: ${{ env.TAILSCALE_TAGS }}
           hostname: gha-hermes-${{ inputs.environment }}-${{ github.run_id }}
 
+      - name: Require authenticated tailnet before SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          tailscale status --json | python3 -c '
+          import json, sys
+          status = json.load(sys.stdin)
+          if status.get("BackendState") != "Running" or not status.get("Self", {}).get("TailscaleIPs"):
+              sys.exit("Tailscale is not authenticated; deployment stopped before SSH")
+          print("Authenticated tailnet connection verified")
+          '
+
       - name: Configure pinned SSH identity
         shell: bash
         env:
