@@ -68,7 +68,10 @@ ACLs remain authoritative for destination access.
    source SHA and immutable image digest. Resolve `deploy_root` from the actual
    environment configuration; do not assume a production or staging default.
 4. Inspect the intended container's image reference/digest, source revision label,
-   start time, running/health state and restart count. Match them to the receipt.
+   start time, running/health state and restart count as current-container evidence.
+   Compare the image digest and source revision with the receipt's deployed digest
+   and source SHA. The receipt does not record container start time, health or
+   restart count; retain its timestamp, result and environment as deployment evidence.
    If a newer release has replaced it, report the old receipt as historical
    deployment evidence and the newer container as current health evidence.
 5. Record evidence paths and scope. If GitHub job logs return 404 or are missing,
