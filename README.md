@@ -53,3 +53,29 @@ Tailscale backend with a local tailnet IP. Failed authentication, malformed
 status, or CLI failure stops the job before SSH credentials are configured
 or the host controller is invoked. Existing SSH host-key checks and tailnet
 ACLs remain authoritative for destination access.
+
+## Verify a deployment
+
+1. Bind the Actions run to the exact application merge SHA and reviewed operations
+   pin. Inspect the required CI aggregate and applicable jobs; a green count that
+   includes skipped jobs or omits a disabled workflow is not full CI evidence.
+2. Check the tailnet join, authenticated-tailnet guard, and host-controller step
+   conclusions. Confirm the caller environment supplies the intended OAuth
+   credentials and tag without printing secret values. API token/key probes alone
+   do not prove a runner joined the tailnet.
+3. On the verified target host, read the matching entry in
+   `<deploy_root>/releases/history.tsv`. Record timestamp, result, environment,
+   source SHA and immutable image digest. Resolve `deploy_root` from the actual
+   environment configuration; do not assume a production or staging default.
+4. Inspect the intended container's image reference/digest, source revision label,
+   start time, running/health state and restart count. Match them to the receipt.
+   If a newer release has replaced it, report the old receipt as historical
+   deployment evidence and the newer container as current health evidence.
+5. Record evidence paths and scope. If GitHub job logs return 404 or are missing,
+   retain the available job/step conclusions and controller receipt; state which
+   details remain unverified. OAuth configuration plus the pinned action's
+   selection logic supports an authentication-path inference, not a recovered
+   login log. Container health does not establish user-message end-to-end behavior.
+
+Verification is read-only. It does not require redeploying an older image,
+changing live dependency selection, or restarting a gateway to recreate evidence.
