@@ -11,6 +11,11 @@ on:
         description: Exact hermes-ops commit containing reviewed build tooling
         required: true
         type: string
+      immutable_only:
+        description: Publish and verify only the source-SHA image; do not move candidate
+        required: false
+        default: false
+        type: boolean
       deployment_lane:
         description: Protected ref and required-check policy to enforce
         required: false
@@ -58,6 +63,14 @@ jobs:
           python3 ops/scripts/deploy/select_deployment_policy.py \
             --lane "$DEPLOYMENT_LANE" \
             --github-env "$GITHUB_ENV"
+      - name: Bind protected caller source
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REPOSITORY" = batumilove/hermes-agent
+          test "$GITHUB_REF_PROTECTED" = true
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
+          test "$GITHUB_REF" = "refs/heads/$source_branch"
       - name: Wait for aggregate CI on the exact source
         run: |
           set -euo pipefail
@@ -84,6 +97,9 @@ jobs:
 
   publish-image:
     needs: wait-for-required-ci
+    concurrency:
+      group: hermes-image-${{ github.repository }}-${{ inputs.source_sha }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -207,6 +223,7 @@ jobs:
           timeout: 10m
 
       - name: Promote scanned image to candidate
+        if: ${{ inputs.immutable_only != true }}
         env:
           TARGET_DIGEST: ${{ steps.resolve.outputs.digest || steps.build.outputs.digest }}
         run: |
