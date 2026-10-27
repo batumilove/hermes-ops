@@ -54,6 +54,38 @@ status, or CLI failure stops the job before SSH credentials are configured
 or the host controller is invoked. Existing SSH host-key checks and tailnet
 ACLs remain authoritative for destination access.
 
+## Immutable-only publication
+
+The reusable `build-image.yml` accepts typed boolean `immutable_only` (default
+`false`, preserving existing callers). Set it to `true` in an independently
+reviewed caller pinned to the exact operations commit, and pass the identical
+`ops_sha`. Only the final `:candidate` promotion is skipped. The source-SHA
+resolve/build, reuse-provenance verification, new GitHub-hosted attestation,
+SBOM and fixable HIGH/CRITICAL vulnerability gate still run. This is not a
+standalone dispatch endpoint and does not disable deployment jobs in a caller;
+use a publication-only caller with no deploy job, or separately prove all caller
+deployment conditions are disabled before dispatch. No `main`, `latest` or
+other mutable tag is introduced here.
+
+Admission requires the caller repository `batumilove/hermes-agent`, a protected
+branch selected by the existing deployment-lane policy, and exact equality of
+caller `github.sha`, requested source SHA and the current policy-branch head.
+The existing aggregate CI context and GitHub Actions app attribution are unchanged.
+Historical commits, tags, unprotected candidate refs and a dispatch from a newer
+commit naming an older source are rejected; immutable-only is not a bypass lane.
+The caller source identity is necessary because GitHub-generated provenance binds
+the caller context, not an arbitrary checkout input. Publication jobs serialize
+by repository and source SHA before resolving an existing tag, preventing two
+cooperating calls from concurrently rebuilding the same source-SHA tag. This is
+not registry-enforced immutability against unrelated writers or administrators.
+
+After a real authorized run, independently resolve the `sha-<source SHA>` tag,
+match its digest to workflow outputs, and verify the OCI attestation's image
+subject, exact source SHA/ref and pinned signer on a GitHub-hosted runner. A
+local Docker image ID or a successful local test is not hosted provenance, and
+a hosted rebuild is not proof of byte equality with a previously tested local
+image. Publication is not staging/production activation.
+
 ## Verify a deployment
 
 1. Bind the Actions run to the exact application merge SHA and reviewed operations
