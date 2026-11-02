@@ -31,7 +31,8 @@ jobs:
           set -euo pipefail
           upstream_sha="$(tr -d '[:space:]' < .github/upstream-base)"
           [[ "$upstream_sha" =~ ^[0-9a-f]{40}$ ]]
-          git fetch --no-tags --depth=1 \
+          # Keep the checkout complete: shallow boundaries hide source ancestry.
+          git fetch --no-tags \
             https://github.com/NousResearch/hermes-agent.git \
             "$upstream_sha"
           git cat-file -e "${upstream_sha}^{commit}"
