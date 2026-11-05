@@ -38,7 +38,9 @@ Replace both `REVIEWED_COMMIT` placeholders with the same full 40-character comm
 The explicit `--ref` keeps future plugin updates pinned; a commit in a tree URL
 selects the initial source but does not itself pin the native installation record.
 
-For an existing `scripts/honcho_monitor.py` cron consumer, run
+For an existing `scripts/honcho_monitor.py` cron consumer, record the wrapper's
+owner and group, then run the migration as its owning cron user. The helper
+preserves the mode, but does not preserve ownership. Run
 `scripts/honcho/migrate_monitor_entrypoint.py` from the reviewed operations
 checkout with `--hermes-home`, `--hermes-cli`, and the inspected wrapper's
 `--expected-sha256`. It checks the installed command, saves the exact old bytes
@@ -48,8 +50,14 @@ The new wrapper invokes the supplied installation CLI and inherits the cron
 profile's environment. It imports no application-internal monitor module.
 
 If filesystem protection prevents creating the backup or replacing the wrapper,
-stop and obtain scoped operator authorization before unlocking the directory.
-Restore its protection immediately after migration, including on failure.
+record the native protection flags of both the directory and the wrapper. Stop
+and obtain scoped operator authorization before unlocking either path; unlocking
+the directory does not clear an immutable flag on the wrapper. Verify the
+replacement and backup owner/group against the recorded values and have the
+authorized operator restore them if needed. Restore every removed protection to
+its corresponding path immediately after the attempt, including on failure and
+on the replacement wrapper after a successful atomic rename. Use a `finally`
+block or shell trap so failure cannot skip restoration.
 
 Verify the installed plugin revision, a fresh CLI invocation and the next
 scheduled run before deleting the core modules. Rollback restores the saved
