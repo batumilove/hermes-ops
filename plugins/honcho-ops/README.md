@@ -30,9 +30,13 @@ Use a reviewed immutable operations commit, with the owning installation's CLI
 and intended profile selected explicitly:
 
 ```bash
-hermes plugins install https://github.com/batumilove/hermes-ops/tree/REVIEWED_COMMIT/plugins/honcho-ops --enable
+hermes plugins install https://github.com/batumilove/hermes-ops/tree/REVIEWED_COMMIT/plugins/honcho-ops --ref REVIEWED_COMMIT --enable
 hermes honcho-ops monitor --help
 ```
+
+Replace both `REVIEWED_COMMIT` placeholders with the same full 40-character commit.
+The explicit `--ref` keeps future plugin updates pinned; a commit in a tree URL
+selects the initial source but does not itself pin the native installation record.
 
 For an existing `scripts/honcho_monitor.py` cron consumer, run
 `scripts/honcho/migrate_monitor_entrypoint.py` from the reviewed operations
@@ -42,6 +46,10 @@ beside the wrapper, then atomically replaces only that wrapper. The job's id,
 schedule, delivery destination, enabled flag and no-agent setting are unchanged.
 The new wrapper invokes the supplied installation CLI and inherits the cron
 profile's environment. It imports no application-internal monitor module.
+
+If filesystem protection prevents creating the backup or replacing the wrapper,
+stop and obtain scoped operator authorization before unlocking the directory.
+Restore its protection immediately after migration, including on failure.
 
 Verify the installed plugin revision, a fresh CLI invocation and the next
 scheduled run before deleting the core modules. Rollback restores the saved
