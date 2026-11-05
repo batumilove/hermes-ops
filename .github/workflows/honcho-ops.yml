@@ -1,0 +1,56 @@
+name: Honcho Ops plugin
+
+on:
+  pull_request:
+    paths:
+      - plugins/honcho-ops/**
+      - scripts/honcho/**
+      - tests/honcho/**
+      - .github/workflows/honcho-ops.yml
+  push:
+    branches: [main]
+    paths:
+      - plugins/honcho-ops/**
+      - scripts/honcho/**
+      - tests/honcho/**
+      - .github/workflows/honcho-ops.yml
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: Honcho contracts (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out the supported Hermes host
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: batumilove/hermes-agent
+          ref: 6d0d3f052c92532c280822fb95514ef05891921b
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out this plugin candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: external-ops
+          persist-credentials: false
+      - name: Prepare the locked test interpreter
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: python
+          extras: '[]'
+          test-environment: 'true'
+          save-tools-cache: 'false'
+          save-python-cache: 'false'
+      - name: Validate the installed plugin surface
+        run: '"$HERMES_PYTHON" -m hermes_cli.main plugins validate "$GITHUB_WORKSPACE/external-ops/plugins/honcho-ops"'
+      - name: Run external monitor, queue and migration contracts
+        env:
+          HERMES_TEST_FILE_RETRIES: '0'
+        run: bash scripts/run_tests.sh external-ops/tests/honcho -q -j 4

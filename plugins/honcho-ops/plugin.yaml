@@ -1,0 +1,5 @@
+name: honcho-ops
+version: 1.0.0
+description: Honcho pipeline health monitoring and read-only queue diagnostics
+author: BatumiLove
+license: MIT

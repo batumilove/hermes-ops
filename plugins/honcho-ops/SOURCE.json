@@ -1,0 +1,9 @@
+{
+  "repository": "batumilove/hermes-agent",
+  "commit": "6d0d3f052c92532c280822fb95514ef05891921b",
+  "files": {
+    "honcho_ops/monitor.py": "hermes_cli/honcho_monitor.py",
+    "honcho_ops/queue_diagnostic.py": "hermes_cli/honcho_queue_diagnostic.py"
+  },
+  "tests": "tests/honcho preserves the original behavior contracts with external imports"
+}

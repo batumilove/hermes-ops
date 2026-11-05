@@ -2,6 +2,7 @@
 
 Fork-owned operational tooling for Hermes deployments:
 
+- external [Honcho Ops CLI plugin](plugins/honcho-ops/README.md) and cron-consumer migration
 - digest-pinned Compose deploy and automatic rollback
 - running-stack acceptance and attestation verification
 - staging Telegram socket diagnostics with crash recovery
