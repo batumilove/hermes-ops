@@ -10,6 +10,62 @@ import pytest
 from honcho_ops import monitor as hm
 
 
+def test_unbound_completion_is_unknown_without_ingestion_alarm():
+    """A transcript final cannot prove eligibility or manufacture an outage."""
+    activity = hm.classify_local_ingestion_activity([
+        {"role": "user", "platform_message_id": "123"},
+        {"role": "assistant", "finish_reason": "stop"},
+    ])
+    assert activity["status"] == "unknown"
+    assert activity["local_latest_ts"] is None
+    alerts = []
+    snapshot = hm.HonchoSnapshot({}, {}, {}, {}, {}, {}, {}, {}, ingestion=activity)
+    hm._ingestion_alerts(snapshot, alerts)
+    assert alerts == []
+
+
+def test_empty_truncated_activity_does_not_prove_idle():
+    """Only a complete empty window establishes local inactivity."""
+    assert hm.classify_local_ingestion_activity([])["status"] == "idle"
+    assert hm.classify_local_ingestion_activity([], truncated=True)["status"] == "unknown"
+
+
+@pytest.mark.parametrize("human_rows, expected", [(0, "idle"), (1, "unknown"), (121, "unknown")])
+def test_local_ingestion_reads_only_owning_profile_activity(tmp_path, human_rows, expected):
+    """Cron activity and saturated reads cannot establish human-turn eligibility."""
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT);
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY, session_id TEXT, timestamp REAL,
+                role TEXT, platform_message_id TEXT, finish_reason TEXT
+            );
+            INSERT INTO sessions VALUES ('human', 'telegram'), ('scheduled', 'cron');
+        """)
+        con.execute(
+            "INSERT INTO messages VALUES (1, 'scheduled', ?, 'assistant', NULL, 'stop')",
+            (hm.time.time(),),
+        )
+        con.executemany(
+            "INSERT INTO messages VALUES (?, 'human', ?, 'assistant', NULL, 'stop')",
+            [(i + 2, hm.time.time()) for i in range(human_rows)],
+        )
+    activity = hm.local_ingestion_activity(db_path)
+    assert activity["status"] == expected
+    assert activity["local_latest_ts"] is None
+    if human_rows == 121:
+        assert activity["reason"] == "activity_window_truncated"
+
+
+def test_missing_local_database_keeps_eligibility_unknown(tmp_path):
+    """An unavailable database must stay unavailable without creating a new one."""
+    activity = hm.local_ingestion_activity(tmp_path / "state.db")
+    assert activity["status"] == "unknown"
+    assert activity["local_latest_ts"] is None
+    assert not (tmp_path / "state.db").exists()
+
+
 def test_short_host_maps_both_dgx_spark_nodes():
     assert hm.short_host("http://192.168.10.211:8001/v1") == "spark-goat"
     assert hm.short_host("http://100.69.54.37:8001/v1") == "spark-goat"
@@ -118,7 +174,7 @@ def test_format_report_shows_loaded_config_dimensions_latency_and_alerts(tmp_pat
     assert report.startswith("🩺 Honcho —")
     assert "Embedding: text-embedding-3-small @ openai" in report
     assert "Embedding env: model=text-embedding-3-small base_url=https://api.openai.com/v1" in report
-    assert "Embedding DB: docs 89/94 dims=768 · messages 80/80 dims=768" in report
+    assert "Embedding DB: docs 89/94 dims=768 · message-embedding rows 80/80 (global) dims=768" in report
     assert "Δ since previous sample: representation +5 · reconciler +5 · webhook +0 · dream +0 · docs +3" in report
     assert "Recent errors: save-repr=2 · 401=1" in report
     assert "spark-goat chat: 1.2s" in report
@@ -994,7 +1050,7 @@ def test_ssh_failure_report_reuses_last_valid_remote_sample():
     assert "⚪ API ⚪ Deriver ⚪ DB ⚪ Redis" in report
     assert "Remote sample: stale (SSH unavailable; last valid counters/config shown)" in report
     assert "Embedding: qwen3-embedding-8b-1536 @ spark-goat" in report
-    assert "Embedding DB: docs 187307/187307 dims=1536 · messages 19529/19532 dims=1536" in report
+    assert "Embedding DB: docs 187307/187307 dims=1536 · message-embedding rows 19529/19532 (global) dims=1536" in report
     assert "Queue: 509 pending · 43 done" in report
 
 
