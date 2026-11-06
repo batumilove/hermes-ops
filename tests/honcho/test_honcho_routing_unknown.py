@@ -53,7 +53,7 @@ def test_unknown_report_separates_routing_advisory_from_service_health():
         spark_goat={'skipped':True,'routing_unknown':True},deriver={})
     alerts=[]
     hm._spark_alerts(snapshot,None,alerts)
-    assert 'Honcho routing unknown: effective config sources unverified' in alerts
+    assert alerts == []
     report=hm.format_report(snapshot)
     assert 'Inspected configuration: UNKNOWN' in report
     assert 'Actual request routing: UNKNOWN / UNVERIFIED' in report

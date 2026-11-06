@@ -5,5 +5,16 @@
     "honcho_ops/monitor.py": "hermes_cli/honcho_monitor.py",
     "honcho_ops/queue_diagnostic.py": "hermes_cli/honcho_queue_diagnostic.py"
   },
-  "tests": "tests/honcho preserves the original behavior contracts with external imports"
+  "tests": "tests/honcho preserves the original behavior contracts with external imports",
+  "followups": [
+    {
+      "repository": "batumilove/hermes-agent",
+      "commit": "955be8a7aafd47e0ca887ffc6c4086a5d7b29bf1",
+      "paths": [
+        "hermes_cli/honcho_monitor.py",
+        "tests/hermes_cli/test_honcho_monitor.py"
+      ],
+      "reason": "Keep unbound ingestion eligibility unknown; preserve service outage alerts independently of routing advisories."
+    }
+  ]
 }

@@ -560,8 +560,7 @@ def _embedding_alerts(snapshot: HonchoSnapshot, alerts: list[str]) -> None:
 
 def _spark_alerts(snapshot: HonchoSnapshot, previous_state: dict[str, Any] | None, alerts: list[str]) -> None:
     spark = snapshot.spark_goat
-    if spark.get("routing_unknown"):
-        alerts.append("Honcho routing unknown: effective config sources unverified")
+    # Routing provenance is rendered as a verification advisory, not an outage.
     if spark.get("skipped"):
         return
     if not spark.get("ok"):
@@ -589,6 +588,9 @@ def _spark_alerts(snapshot: HonchoSnapshot, previous_state: dict[str, Any] | Non
 
 def _ingestion_alerts(snapshot: HonchoSnapshot, alerts: list[str]) -> None:
     ingestion = snapshot.ingestion or {}
+    if ingestion.get("status") == "unknown":
+        # Missing eligibility evidence is advisory, not an outage.
+        return
     if ingestion.get("source_fresh") and not ingestion.get("downstream_fresh"):
         try:
             drift_s = int(float(ingestion.get("drift_s") or 0))
@@ -677,6 +679,8 @@ def _deriver_alerts(snapshot: HonchoSnapshot, previous_state: dict[str, Any] | N
             )
 
 def _format_age(seconds: float | None) -> str:
+    if seconds is None:
+        return "UNKNOWN"
     try:
         total = max(0, int(float(seconds or 0)))
     except (TypeError, ValueError):
@@ -714,6 +718,45 @@ def _parse_pg_timestamptz(value: str | None) -> datetime | None:
     return _now_utc(dt)
 
 
+def classify_local_ingestion_activity(rows: list[dict[str, Any]], *, truncated: bool = False) -> dict[str, Any]:
+    """Do not promote transcript ordering into proof of a newly completed turn.
+
+    Platform IDs distinguish inbound association, not writer eligibility. Stop
+    finals and message UIDs survive transcript rewrites; no persisted turn-to-
+    completion binding exists in this schema. Never synthesize a watermark.
+    """
+    reason = "activity_present_completion_unproven"
+    if truncated:
+        reason = "activity_window_truncated"
+    elif not rows:
+        return {"status": "idle", "reason": "no_recent_activity", "local_latest_ts": None}
+    elif any(row.get("role") == "assistant" for row in rows):
+        reason = "completion_binding_unavailable"
+    return {"status": "unknown", "reason": reason, "local_latest_ts": None}
+
+
+def local_ingestion_activity(path: Path | str | None = None) -> dict[str, Any]:
+    """Metadata-only safe reader; saturated/failed evidence is UNKNOWN."""
+    from hermes_cli.state_db_cmd import query_state_db
+
+    db_path = Path(path) if path is not None else _state_db_path()
+    cutoff = time.time() - _monitor_int("INGESTION_STALE_SECONDS", INGESTION_STALE_SECONDS)
+    try:
+        result = query_state_db(
+            "SELECT m.role, m.platform_message_id, m.finish_reason "
+            "FROM messages AS m LEFT JOIN sessions AS s ON s.id=m.session_id "
+            f"WHERE m.timestamp >= {float(cutoff)} "
+            "AND m.role IN ('user','assistant') "
+            "AND (s.source IS NULL OR s.source != 'cron') "
+            "ORDER BY m.id DESC LIMIT 121",
+            hermes_home=db_path.parent, max_rows=120,
+        )
+    except (sqlite3.Error, OSError, ValueError):
+        return {"status": "unknown", "reason": "local_query_unavailable", "local_latest_ts": None}
+    rows = [dict(zip(result["columns"], row)) for row in result["rows"]]
+    return classify_local_ingestion_activity(rows, truncated=result["truncated"])
+
+
 def latest_local_message_timestamp(path: Path | str | None = None) -> float | None:
     try:
         con = sqlite3.connect(Path(path) if path is not None else _state_db_path())
@@ -749,6 +792,8 @@ def build_ingestion_status(local_ts: float | None, honcho_latest_raw: str | None
     downstream_age_s = int((now_dt - honcho_dt).total_seconds()) if honcho_dt else None
     drift_s = int((local_dt - honcho_dt).total_seconds()) if local_dt and honcho_dt else None
     return {
+        "status": "unknown" if local_ts is None or honcho_dt is None else "aggregate_only",
+        "scope": "local eligible watermark vs global remote persistence; not per-session proof",
         "local_latest_ts": local_ts,
         "local_latest_iso": local_dt.isoformat() if local_dt else "",
         "honcho_latest_raw": (honcho_latest_raw or "").strip(),
@@ -818,7 +863,7 @@ def format_report(snapshot: dict[str, Any] | HonchoSnapshot, previous_state: dic
         "  Embedding DB: "
         f"docs {snapshot.db.get('documents_with_embeddings', 0)}/{snapshot.db.get('documents_total', 0)} "
         f"dims={snapshot.db.get('documents_dims', '?')} · "
-        f"messages {snapshot.db.get('messages_with_embeddings', 0)}/{snapshot.db.get('messages_total', 0)} "
+        f"message-embedding rows {snapshot.db.get('messages_with_embeddings', 0)}/{snapshot.db.get('messages_total', 0)} (global) "
         f"dims={snapshot.db.get('messages_dims', '?')}"
     )
 
@@ -865,10 +910,16 @@ def format_report(snapshot: dict[str, Any] | HonchoSnapshot, previous_state: dic
     if ingestion:
         lines.append(
             "🔁 Ingestion: "
+            f"eligibility={ingestion.get('status', 'legacy')} · "
             f"local age={_format_age(ingestion.get('source_age_s'))} · "
             f"Honcho age={_format_age(ingestion.get('downstream_age_s'))} · "
             f"drift={_format_age(ingestion.get('drift_s'))}"
         )
+
+    if ingestion.get("status") == "unknown":
+        lines.append("⚠️ Verification advisory: ingestion eligibility UNKNOWN; completed-human write eligibility and per-session remote matching are unproven (not evidence of outage; no loss-free or eligible-turn classification claim)")
+    elif ingestion.get("status") == "idle":
+        lines.append("  Ingestion advisory: N/A (no recent activity; not proof of loss-free processing)")
 
     observer = snapshot.observer or {}
     if observer:
@@ -1244,7 +1295,13 @@ def collect_snapshot() -> tuple[HonchoSnapshot, dict[str, Any]]:
         "docker exec honcho-database-1 psql -U postgres -t -A -c \"SELECT COALESCE(max(created_at)::text, '') FROM messages;\"",
         timeout=20,
     )
-    ingestion = build_ingestion_status(latest_local_message_timestamp(), honcho_latest_raw)
+    local_activity = local_ingestion_activity()
+    ingestion = build_ingestion_status(local_activity["local_latest_ts"], honcho_latest_raw)
+    ingestion["status"] = (
+        local_activity["status"] if _parse_pg_timestamptz(honcho_latest_raw) else "unknown"
+    )
+    ingestion["reason"] = local_activity["reason"]
+    ingestion["scope"] = "owning-profile activity; remote canonical messages global inventory only"
 
     queue_raw = ssh(
         "docker exec honcho-database-1 psql -U postgres -t -A -F '|' -c \""

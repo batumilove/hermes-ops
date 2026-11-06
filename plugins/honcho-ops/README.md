@@ -13,7 +13,12 @@ hermes honcho-ops queue
 The monitor preserves the existing contract: healthy runs produce no stdout;
 alerts are formatted for verbatim script-only cron delivery. Its state remains
 `cache/honcho_monitor.json` under the owning profile, and local ingestion reads
-that profile's `state.db`. Existing `HONCHO_MONITOR_*` and `HONCHO_DIAGNOSTIC_*`
+that profile's `state.db`. Transcript ordering does not prove a completed,
+write-eligible human turn: unbound, truncated or unavailable local activity stays
+UNKNOWN and produces a verification advisory rather than an ingestion outage.
+An empty, complete activity window is idle; global remote inventory does not
+prove per-session ingestion. Independent API, database, disk and chat failures
+remain alerts. Existing `HONCHO_MONITOR_*` and `HONCHO_DIAGNOSTIC_*`
 overrides retain their meanings. Probes use the existing SSH/tbot transport and
 bounded read-only database queries. A monitor run can issue the configured chat
 health probe; it is not an offline validation command. Queue diagnostics read
