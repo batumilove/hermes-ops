@@ -11,6 +11,7 @@ from honcho_ops import monitor as hm
 
 
 def test_unbound_completion_is_unknown_without_ingestion_alarm():
+    """A transcript final cannot prove eligibility or manufacture an outage."""
     activity = hm.classify_local_ingestion_activity([
         {"role": "user", "platform_message_id": "123"},
         {"role": "assistant", "finish_reason": "stop"},
@@ -24,12 +25,14 @@ def test_unbound_completion_is_unknown_without_ingestion_alarm():
 
 
 def test_empty_truncated_activity_does_not_prove_idle():
+    """Only a complete empty window establishes local inactivity."""
     assert hm.classify_local_ingestion_activity([])["status"] == "idle"
     assert hm.classify_local_ingestion_activity([], truncated=True)["status"] == "unknown"
 
 
 @pytest.mark.parametrize("human_rows, expected", [(0, "idle"), (1, "unknown"), (121, "unknown")])
 def test_local_ingestion_reads_only_owning_profile_activity(tmp_path, human_rows, expected):
+    """Cron activity and saturated reads cannot establish human-turn eligibility."""
     db_path = tmp_path / "state.db"
     with sqlite3.connect(db_path) as con:
         con.executescript("""
@@ -56,6 +59,7 @@ def test_local_ingestion_reads_only_owning_profile_activity(tmp_path, human_rows
 
 
 def test_missing_local_database_keeps_eligibility_unknown(tmp_path):
+    """An unavailable database must stay unavailable without creating a new one."""
     activity = hm.local_ingestion_activity(tmp_path / "state.db")
     assert activity["status"] == "unknown"
     assert activity["local_latest_ts"] is None

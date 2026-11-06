@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone, UTC
 from pathlib import Path
@@ -737,24 +738,29 @@ def classify_local_ingestion_activity(rows: list[dict[str, Any]], *, truncated: 
 
 def local_ingestion_activity(path: Path | str | None = None) -> dict[str, Any]:
     """Metadata-only safe reader; saturated/failed evidence is UNKNOWN."""
-    from hermes_cli.state_db_cmd import query_state_db
+    from hermes_cli.sqlite_safe_read import connect_tracked
+    from hermes_state_holders import read_only_db_uri
 
-    db_path = Path(path) if path is not None else _state_db_path()
-    cutoff = time.time() - _monitor_int("INGESTION_STALE_SECONDS", INGESTION_STALE_SECONDS)
     try:
-        result = query_state_db(
-            "SELECT m.role, m.platform_message_id, m.finish_reason "
-            "FROM messages AS m LEFT JOIN sessions AS s ON s.id=m.session_id "
-            f"WHERE m.timestamp >= {float(cutoff)} "
-            "AND m.role IN ('user','assistant') "
-            "AND (s.source IS NULL OR s.source != 'cron') "
-            "ORDER BY m.id DESC LIMIT 121",
-            hermes_home=db_path.parent, max_rows=120,
-        )
-    except (sqlite3.Error, OSError, ValueError):
+        db_path = (Path(path) if path is not None else _state_db_path()).expanduser()
+        cutoff = time.time() - _monitor_int("INGESTION_STALE_SECONDS", INGESTION_STALE_SECONDS)
+        with closing(connect_tracked(
+            read_only_db_uri(db_path), tracking_path=db_path, uri=True, timeout=5.0,
+        )) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT m.role, m.platform_message_id, m.finish_reason "
+                "FROM messages AS m LEFT JOIN sessions AS s ON s.id=m.session_id "
+                "WHERE m.timestamp >= ? AND m.role IN ('user','assistant') "
+                "AND (s.source IS NULL OR s.source != 'cron') "
+                "ORDER BY m.id DESC LIMIT 121",
+                (cutoff,),
+            ).fetchmany(121)
+            activity = [dict(row) for row in rows[:120]]
+    except (sqlite3.Error, OSError, ValueError, RuntimeError):
         return {"status": "unknown", "reason": "local_query_unavailable", "local_latest_ts": None}
-    rows = [dict(zip(result["columns"], row)) for row in result["rows"]]
-    return classify_local_ingestion_activity(rows, truncated=result["truncated"])
+    return classify_local_ingestion_activity(activity, truncated=len(rows) > 120)
 
 
 def latest_local_message_timestamp(path: Path | str | None = None) -> float | None:
@@ -1297,9 +1303,7 @@ def collect_snapshot() -> tuple[HonchoSnapshot, dict[str, Any]]:
     )
     local_activity = local_ingestion_activity()
     ingestion = build_ingestion_status(local_activity["local_latest_ts"], honcho_latest_raw)
-    ingestion["status"] = (
-        local_activity["status"] if _parse_pg_timestamptz(honcho_latest_raw) else "unknown"
-    )
+    ingestion["status"] = local_activity["status"]
     ingestion["reason"] = local_activity["reason"]
     ingestion["scope"] = "owning-profile activity; remote canonical messages global inventory only"
 

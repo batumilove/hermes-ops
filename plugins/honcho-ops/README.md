@@ -13,7 +13,8 @@ hermes honcho-ops queue
 The monitor preserves the existing contract: healthy runs produce no stdout;
 alerts are formatted for verbatim script-only cron delivery. Its state remains
 `cache/honcho_monitor.json` under the owning profile, and local ingestion reads
-that profile's `state.db`. Transcript ordering does not prove a completed,
+that profile's `state.db` (or the exact configured database-file override).
+Transcript ordering does not prove a completed,
 write-eligible human turn: unbound, truncated or unavailable local activity stays
 UNKNOWN and produces a verification advisory rather than an ingestion outage.
 An empty, complete activity window is idle; global remote inventory does not
