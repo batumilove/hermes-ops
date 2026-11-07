@@ -27,6 +27,7 @@ from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+from .config_inspection import KEYS as INSPECTION_KEYS, config_inspection_command, collect_config_inspection
 
 # Use Teleport SSH by default. The Honcho host is enrolled and available via
 # the cron tbot config, which keeps unattended runs off the interactive LAN path.
@@ -120,6 +121,7 @@ class HonchoSnapshot:
     deriver: dict[str, Any]
     ingestion: dict[str, Any] = field(default_factory=dict)
     observer: dict[str, Any] = field(default_factory=dict)
+    inspected_config: dict[str, Any] = field(default_factory=dict)
 
 
 def sanitize_base_url(url: str | None) -> str:
@@ -488,6 +490,18 @@ def next_representation_stall_streak(
 
 def build_alerts(snapshot: HonchoSnapshot, previous_state: dict[str, Any] | None = None) -> list[str]:
     alerts: list[str] = []
+    # Only validated fresh receipts can confirm absence. Acquisition failures
+    # remain unobservable advisories, never configuration/service outages.
+    inspection = snapshot.inspected_config or {}
+    if inspection.get("status") in {"inspected", "incomplete"}:
+        for container in ("api", "deriver"):
+            row = inspection.get("containers", {}).get(container, {})
+            for key, present in zip(INSPECTION_KEYS, row.get("present", [])):
+                if present is False:
+                    alerts.append(
+                        "Configuration warning: observed required input missing "
+                        f"({container}: {key}); effective precedence UNVERIFIED"
+                    )
     if not _observer_service_alerts(snapshot, previous_state, alerts):
         return alerts
     _embedding_alerts(snapshot, alerts)
@@ -940,6 +954,7 @@ def format_report(snapshot: dict[str, Any] | HonchoSnapshot, previous_state: dic
     service_alerts = [
         alert for alert in alerts
         if alert != "Honcho routing unknown: effective config sources unverified"
+        and not alert.startswith("Configuration warning: observed required input missing")
         and not (not spark and alert == "spark-goat chat failed")
     ]
     if snapshot.services.get("ssh_ok") is False:
@@ -948,7 +963,16 @@ def format_report(snapshot: dict[str, Any] | HonchoSnapshot, previous_state: dic
         lines.append("  Service/processing checks: ALERT")
     else:
         lines.append("  Service/processing checks: nominal (sampled checks only; not loss-free processing proof)")
-    lines.append("  Inspected configuration: UNKNOWN (fresh receipt not collected)")
+    inspection = snapshot.inspected_config
+    for alert in alerts:
+        if alert.startswith("Configuration warning: observed required input missing"):
+            lines.append(f"⚠️ {alert}")
+    if inspection.get("status") == "inspected":
+        lines.append("  Inspected configuration: INSPECTED (both containers; four finite-key presence checks and config source digest; effective precedence UNVERIFIED)")
+    elif inspection:
+        lines.append("  Inspected configuration: UNKNOWN (fresh finite-key inspection unavailable/incomplete; check transport, container and required input presence)")
+    else:
+        lines.append("  Inspected configuration: UNKNOWN (fresh receipt not collected)")
     lines.append("  Actual request routing: UNKNOWN / UNVERIFIED (no natural dispatch receipt)")
     if service_alerts:
         lines.append(f"⚠️ {len(service_alerts)}: {'; '.join(service_alerts)}")
@@ -1426,6 +1450,7 @@ def collect_snapshot() -> tuple[HonchoSnapshot, dict[str, Any]]:
         },
         ingestion=ingestion,
         observer=observer,
+        inspected_config=collect_config_inspection(ssh),
     )
 
     current_state = {
@@ -1452,6 +1477,7 @@ def collect_snapshot() -> tuple[HonchoSnapshot, dict[str, Any]]:
             "active_other_oldest_age_s": active_other_oldest_age_s,
         },
         "ingestion": ingestion,
+        "inspected_config": snapshot.inspected_config,
         "observer": observer,
         "deriver_active_count": active_count,
         "deriver_active_oldest_age_s": active_oldest_age_s,
