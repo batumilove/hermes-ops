@@ -75,3 +75,38 @@ the old wrapper. Never rewrite or restart the gateway as part of this migration.
 behavior tests live in `tests/honcho` in this operations repository and run via
 the pinned Hermes host's `scripts/run_tests.sh`. The plugin workflow exercises
 Linux and macOS, installed CLI discovery, per-profile state, and wrapper recovery.
+
+## Durable verification receipts
+
+The compatible receipt-emitting Honcho writer records the admitted completed-turn
+boundary before its asynchronous write is queued. Local receipts are private
+SQLite files under the owning profile's `cache/honcho-receipts/`. They contain
+session/workspace and part identities, timestamps and remote IDs; no text, prompt
+hashes or credentials. Confirmed parts require the server's echoed correlation
+metadata and matching workspace/session. The monitor independently checks those
+exact remote identities against PostgreSQL. This proves the sampled admitted
+writer boundary only; it is not transcript-wide coverage or proof of downstream
+conclusion quality. Missing or truncated evidence remains unverified. Uncertain
+requests are never automatically replayed by this tooling.
+
+`scripts/honcho/nous_auth_proxy.py` preserves the deployed proxy's token and
+1536-dimensional embedding behavior, adding private HTTP-attempt receipts with
+requested model, sanitized upstream origin, caller, outcome and error class.
+Neither request nor response content is recorded. Completed receipts retain seven
+days; outstanding debt is preserved. A successful upstream response is not proof
+of semantic output or complete coverage of every pipeline stage.
+
+Fresh configuration inspection reconstructs route fields with each deployed
+image's actual settings parser in an empty credential environment, network-blocked
+and without file sources. Existing `.env` or TOML files make this check unverified.
+Reports distinguish that reconstruction from the running process's memory and
+from observed HTTP attempts. All five configured dialectic levels are displayed.
+
+Deploy the proxy atomically through the existing scripts lifecycle, preserving
+its exact prior bytes/mode and directory protections, then restart only its own
+user service. Install both plugins at immutable refs through `hermes plugins
+install --force --ref ... --enable --yes-deps`; activate the writer with the
+supported gateway lifecycle command. Preserve receipt databases during code-only
+rollback. Verify a naturally admitted turn; never send synthetic conversation
+content to manufacture acceptance. The monitor's regular cron schedule and
+delivery destination remain unchanged.
