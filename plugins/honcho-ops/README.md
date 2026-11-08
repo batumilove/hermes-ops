@@ -146,7 +146,10 @@ The server can also persist private caller receipts before provider dispatch,
 using `HONCHO_REQUEST_RECEIPT_PATH`. On the Honcho host, persist the API and
 deriver stores separately as `/var/lib/honcho-receipts/api.sqlite3` and
 `deriver.sqlite3`, mounted privately into their respective containers. The SSH
-collector reads at most 1000 recent or unfinished requests per store, including
+collector runs a read-only SQLite probe through the API container as its existing
+application user; no receipt permissions are widened for the host login. Bind
+directory ownership must be derived from the actual container UID/GID rather
+than assumed to match the SSH user. The collector reads at most 1000 recent or unfinished requests per store, including
 old unfinished debt. Caller errors and cancellations alert even if the proxy is
 unreachable. Opaque request IDs join caller and proxy attempts; an unmatched
 success remains explicitly unmatched rather than being classified as an outage.

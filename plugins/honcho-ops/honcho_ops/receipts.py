@@ -286,8 +286,17 @@ def caller_receipts(ssh_fn, proxy, *, now=None):
         "scope": "instrumented OpenAI caller boundary; sampled proxy correlation",
     }
     try:
-        code = Path(__file__).with_name("caller_receipt_probe.py").read_text()
-        stores = json.loads(ssh_fn("python3 -I -B -c " + shlex.quote(code), timeout=15))
+        code = (
+            "import os; os.environ.clear()\n"
+            + Path(__file__).with_name("caller_receipt_probe.py").read_text()
+        )
+        stores = json.loads(
+            ssh_fn(
+                "docker exec honcho-api-1 /app/.venv/bin/python -I -B -c "
+                + shlex.quote(code),
+                timeout=15,
+            )
+        )
         if not isinstance(stores, dict) or set(stores) != {"api", "deriver"}:
             raise ValueError()
         rows = []
