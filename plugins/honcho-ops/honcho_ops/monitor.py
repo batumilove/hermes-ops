@@ -262,7 +262,7 @@ def parse_pipeline_env(raw: str) -> dict[str, dict[str, str]]:
         prefix = key.removesuffix("__OVERRIDES__BASE_URL")
         route = {"base_url": sanitize_base_url(value),
                  "model": str(leaves.get(prefix + "__MODEL") or "")}
-        if route not in parsed.values():
+        if prefix.startswith("DIALECTIC_LEVELS__") or route not in parsed.values():
             parsed["route:" + prefix.lower()] = route
     return parsed
 
@@ -589,6 +589,17 @@ def _spark_alerts(snapshot: HonchoSnapshot, previous_state: dict[str, Any] | Non
 
 def _ingestion_alerts(snapshot: HonchoSnapshot, alerts: list[str]) -> None:
     ingestion = snapshot.ingestion or {}
+    receipt = ingestion.get("receipts", {})
+    if receipt.get("status") in {"failed", "delayed", "unknown"}:
+        alerts.append("Honcho writer receipts " + receipt["status"])
+    if ingestion.get("config_receipts", {}).get("status") == "mismatch":
+        alerts.append("Honcho API/deriver route configuration mismatch")
+    caller = ingestion.get("caller_receipts", {})
+    if caller.get("status") in {"failed", "delayed"}:
+        alerts.append("Honcho caller requests " + caller["status"])
+    route_receipt = ingestion.get("routing_receipts", {})
+    if route_receipt.get("status") in {"failed", "delayed"}:
+        alerts.append("Honcho proxy requests " + route_receipt["status"])
     if ingestion.get("status") == "unknown":
         # Missing eligibility evidence is advisory, not an outage.
         return
@@ -855,6 +866,11 @@ def format_report(snapshot: dict[str, Any] | HonchoSnapshot, previous_state: dic
         stage = snapshot.pipeline.get(key, {})
         lines.append(f"  {label}: {stage.get('model', '?')} @ {short_host(stage.get('base_url'))}")
 
+    for level in ("minimal", "low", "medium", "high", "max"):
+        route = snapshot.pipeline.get("route:dialectic_levels__" + level + "__model_config")
+        if route:
+            lines.append(f"  Dialectic {level}: {route.get('model', '?')} @ {short_host(route.get('base_url'))}")
+
     embed = snapshot.pipeline.get("embedding", {})
     vector_dims_display = _embedding_vector_dimensions_display(embed, snapshot.db)
     lines.append(
@@ -948,11 +964,38 @@ def format_report(snapshot: dict[str, Any] | HonchoSnapshot, previous_state: dic
         lines.append("  Service/processing checks: ALERT")
     else:
         lines.append("  Service/processing checks: nominal (sampled checks only; not loss-free processing proof)")
-    lines.append("  Inspected configuration: UNKNOWN (fresh receipt not collected)")
-    lines.append("  Actual request routing: UNKNOWN / UNVERIFIED (no natural dispatch receipt)")
+    config_receipt = (snapshot.ingestion or {}).get("config_receipts", {})
+    if config_receipt.get("status") == "reconstructed":
+        lines.append("  Inspected configuration: MATCHED (both deployed parsers, isolated route inputs; not process-memory proof)")
+    elif config_receipt.get("status") == "mismatch":
+        lines.append("  Inspected configuration: MISMATCH (API and deriver route fields differ)")
+    else:
+        lines.append("  Inspected configuration: UNKNOWN (fresh receipt not collected)")
+    receipt = (snapshot.ingestion or {}).get("receipts", {})
+    if receipt:
+        lines.append(f"  Writer receipts: {receipt.get('status', 'unverified')} · verified={receipt.get('verified', 0)} · pending={receipt.get('pending', '?')} · uncertain={receipt.get('uncertain', '?')} (admitted turns only)")
+    caller = (snapshot.ingestion or {}).get("caller_receipts", {})
+    lines.append(f"  Caller receipts: {caller.get('status', 'unverified')} · failed={caller.get('failed', '?')} · pending={caller.get('pending', '?')} · proxy matched={caller.get('proxy_matched', '?')} · unmatched={caller.get('proxy_unmatched', '?')}")
+    route_receipt = (snapshot.ingestion or {}).get("routing_receipts", {})
+    if route_receipt.get("status") in {"observed", "failed", "delayed", "pending"}:
+        lines.append(f"  Actual proxy routing: {route_receipt['status']} · successful={route_receipt.get('successful', '?')} · failed={route_receipt.get('failed', '?')} · pending={route_receipt.get('pending', '?')} (requested model; stage attribution is sampled)")
+        for route in route_receipt.get("routes", []):
+            stage = route.get("stage", "unattributed")
+            label = f"{stage}/{route['operation']}" if stage != "unattributed" else f"{route['operation']} (stage unverified)"
+            lines.append(f"    {label}: {route['model']} → {short_host(route['endpoint'])}")
+        if route_receipt.get("stage_coverage"):
+            coverage = " · ".join(f"{k}={v}" for k,v in route_receipt["stage_coverage"].items())
+            lines.append("  Stage receipts: " + coverage)
+    else:
+        lines.append("  Actual request routing: UNKNOWN / UNVERIFIED (no natural dispatch receipt)")
     if service_alerts:
         lines.append(f"⚠️ {len(service_alerts)}: {'; '.join(service_alerts)}")
-    lines.append("⚠️ Verification advisory: configuration provenance UNKNOWN; actual traffic UNVERIFIED (not evidence of outage)")
+    if config_receipt.get("status") or route_receipt.get("status"):
+        config_label = config_receipt.get("status", "unknown")
+        route_label = route_receipt.get("status", "unverified")
+        lines.append(f"  Verification scope: configuration={config_label}; proxy attempts={route_label}; complete stage coverage is not inferred from sampled calls; transcript-wide ingestion remains unverified")
+    else:
+        lines.append("⚠️ Verification advisory: configuration provenance UNKNOWN; actual traffic UNVERIFIED (not evidence of outage)")
 
     return "\n".join(lines)
 
@@ -1306,6 +1349,17 @@ def collect_snapshot() -> tuple[HonchoSnapshot, dict[str, Any]]:
     ingestion["status"] = local_activity["status"]
     ingestion["reason"] = local_activity["reason"]
     ingestion["scope"] = "owning-profile activity; remote canonical messages global inventory only"
+    from hermes_constants import get_hermes_home
+    from .receipts import ingestion_receipts, routing_receipts, config_receipts, caller_receipts
+    ingestion["receipts"] = ingestion_receipts(get_hermes_home(), ssh)
+    ingestion["routing_receipts"] = routing_receipts(
+        get_hermes_home(), path=os.environ.get("HONCHO_MONITOR_PROXY_RECEIPTS"),
+        caller=os.environ.get("HONCHO_MONITOR_PROXY_CALLER"))
+    ingestion["caller_receipts"] = caller_receipts(ssh, ingestion["routing_receipts"])
+    ingestion["routing_receipts"].pop("request_ids", None)
+    ingestion["config_receipts"] = config_receipts(ssh)
+    if ingestion["config_receipts"].get("status") == "reconstructed":
+        pipeline["_routing"] = {"status": "reconstructed", "reason": "both deployed parsers; isolated selected route inputs"}
 
     queue_raw = ssh(
         "docker exec honcho-database-1 psql -U postgres -t -A -F '|' -c \""

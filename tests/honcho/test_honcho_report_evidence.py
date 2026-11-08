@@ -43,3 +43,37 @@ def test_failed_request_and_stale_remote_sample_remain_visible():
     assert "spark-goat chat failed" in hm.build_alerts(snapshot)
     stale = replace(snapshot, services={**snapshot.services, "ssh_ok": False})
     assert "Service/processing checks: UNKNOWN (remote sample stale)" in hm.format_report(stale)
+
+
+@pytest.mark.parametrize("route_status", ["failed", "delayed", "pending", "observed"])
+def test_receipt_advisory_preserves_independent_configuration_and_attempt_evidence(route_status):
+    snapshot = _healthy_snapshot({"skipped": True})
+    snapshot = replace(snapshot, ingestion={
+        "config_receipts": {"status": "reconstructed"},
+        "routing_receipts": {"status": route_status},
+    })
+    report = hm.format_report(snapshot)
+    assert "Inspected configuration: MATCHED" in report
+    assert "configuration=reconstructed" in report
+    assert f"proxy attempts={route_status}" in report
+    assert "configuration provenance UNKNOWN" not in report
+    assert "complete stage coverage" in report
+
+
+def test_configuration_mismatch_is_reported_as_such():
+    snapshot = replace(_healthy_snapshot({"skipped": True}), ingestion={"config_receipts":{"status":"mismatch"}})
+    report = hm.format_report(snapshot)
+    assert "Inspected configuration: MISMATCH" in report
+    assert "Honcho API/deriver route configuration mismatch" in hm.build_alerts(snapshot)
+
+
+def test_stage_report_uses_explicit_attribution_with_shared_model():
+    snapshot = replace(_healthy_snapshot({"skipped": True}), ingestion={"routing_receipts": {
+        "status":"observed", "successful":2, "failed":0, "pending":0,
+        "stage_coverage":{"deriver":"observed","summary":"observed","dream":"not_observed"},
+        "routes":[{"stage":stage,"operation":"chat","model":"shared-model","endpoint":"https://provider.example"} for stage in ("deriver","summary")],
+    }})
+    report = hm.format_report(snapshot)
+    assert "deriver/chat: shared-model" in report
+    assert "summary/chat: shared-model" in report
+    assert "dream=not_observed" in report
