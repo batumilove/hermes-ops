@@ -988,6 +988,8 @@ def format_report(snapshot: dict[str, Any] | HonchoSnapshot, previous_state: dic
             lines.append("  Stage receipts: " + coverage)
     else:
         lines.append("  Actual request routing: UNKNOWN / UNVERIFIED (no natural dispatch receipt)")
+    if route_receipt.get('historical_terminal_missing'):
+        lines.append(f"  Historical proxy evidence: {route_receipt['historical_terminal_missing']} terminal receipt missing; exact caller terminal verified; proxy outcome UNKNOWN (not an ongoing request)")
     if service_alerts:
         lines.append(f"⚠️ {len(service_alerts)}: {'; '.join(service_alerts)}")
     if config_receipt.get("status") or route_receipt.get("status"):
@@ -1356,6 +1358,9 @@ def collect_snapshot() -> tuple[HonchoSnapshot, dict[str, Any]]:
         get_hermes_home(), path=os.environ.get("HONCHO_MONITOR_PROXY_RECEIPTS"),
         caller=os.environ.get("HONCHO_MONITOR_PROXY_CALLER"))
     ingestion["caller_receipts"] = caller_receipts(ssh, ingestion["routing_receipts"])
+    from .receipts import reconcile_proxy_terminals
+    ingestion["routing_receipts"] = reconcile_proxy_terminals(ingestion["routing_receipts"], ingestion["caller_receipts"])
+    ingestion["caller_receipts"].pop("_terminals", None)
     ingestion["routing_receipts"].pop("request_ids", None)
     ingestion["config_receipts"] = config_receipts(ssh)
     if ingestion["config_receipts"].get("status") == "reconstructed":
