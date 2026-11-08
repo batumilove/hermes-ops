@@ -116,6 +116,17 @@ class EvidenceTests(unittest.TestCase):
             rows = repr(c.execute("SELECT * FROM routes").fetchall())
             self.assertNotIn("secret", rows)
 
+    def test_final_upstream_origin_is_recorded_without_credentials_or_query(self):
+        with patch.dict("os.environ", {"HERMES_HOME": str(self.home)}):
+            i = proxy.route_begin("client", "/v1/chat/completions", "model")
+            proxy.route_finish(
+                i,
+                200,
+                actual_url="https://user:secret@final.example:8443/path?token=hidden",
+            )
+        r = routing_receipts(self.home)
+        self.assertEqual(r["routes"][0]["endpoint"], "https://final.example:8443")
+
     def test_handler_failure_is_recorded_without_exception_text(self):
         h = object.__new__(proxy.H)
         h.path = "/v1/chat/completions"

@@ -111,8 +111,17 @@ def route_begin(caller, path, model):
     return ident
 
 
-def route_finish(ident, status, error_class=None):
+def route_finish(ident, status, error_class=None, actual_url=None):
     with receipt_db() as c:
+        if actual_url:
+            u = urlsplit(actual_url)
+            origin = (
+                u.scheme
+                + "://"
+                + (u.hostname or "")
+                + (":" + str(u.port) if u.port else "")
+            )
+            c.execute("UPDATE routes SET endpoint=? WHERE id=?", (origin, ident))
         c.execute(
             "UPDATE routes SET finished=?,status=?,error_class=? WHERE id=?",
             (time.time(), status, error_class, ident),
@@ -167,6 +176,7 @@ class H(BaseHTTPRequestHandler):
         receipt = None
         status = None
         failure = None
+        actual_url = None
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
@@ -197,9 +207,11 @@ class H(BaseHTTPRequestHandler):
             try:
                 with urllib.request.urlopen(req, timeout=120) as r:
                     status = r.status
+                    actual_url = r.geturl()
                     self._reply(r.status, r.read())
             except urllib.error.HTTPError as e:
                 status = e.code
+                actual_url = e.geturl()
                 failure = "HTTPError"
                 self._reply(e.code, e.read())
         except Exception as e:
@@ -213,7 +225,7 @@ class H(BaseHTTPRequestHandler):
         finally:
             if receipt:
                 try:
-                    route_finish(receipt, status, failure)
+                    route_finish(receipt, status, failure, actual_url)
                 except Exception:
                     sys.stderr.write("route receipt completion unavailable\n")
 
