@@ -319,6 +319,116 @@ class EvidenceTests(unittest.TestCase):
             replies, [(400, b'{"error":"invalid"}', "application/problem+json")]
         )
 
+    def test_exact_pipeline_stage_is_not_guessed_from_shared_model(self):
+        expected = dict(proxy.PURPOSE_STAGES)
+        expected["embedding"] = "embedding"
+        with patch.dict("os.environ", {"HERMES_HOME": str(self.home)}):
+            for i, (purpose, stage) in enumerate(expected.items()):
+                headers = {
+                    "X-Honcho-Request-ID": f"{i:032x}",
+                    "X-Honcho-Stage": stage,
+                    "Authorization": "FAKE-NOT-STORED",
+                }
+                if stage != "embedding":
+                    headers["X-Honcho-Call-Purpose"] = purpose
+                path = (
+                    "/v1/embeddings" if stage == "embedding" else "/v1/chat/completions"
+                )
+                row = proxy.route_begin("caller", path, "same-model", headers=headers)
+                proxy.route_finish(row, 200)
+        result = routing_receipts(self.home)
+        self.assertEqual(set(result["stage_coverage"].values()), {"observed"})
+        self.assertEqual(result["unattributed"], 0)
+        self.assertEqual(
+            {r["stage"] for r in result["routes"]},
+            {"deriver", "dialectic", "embedding", "summary", "dream"},
+        )
+        with sqlite3.connect(self.path.parent / "routes.sqlite3") as c:
+            self.assertNotIn(
+                "FAKE-NOT-STORED",
+                repr(c.execute("SELECT * FROM correlations").fetchall()),
+            )
+
+    def test_sdk_retry_correlation_does_not_overwrite_http_attempt_identity(self):
+        headers = {
+            "X-Honcho-Request-ID": "a" * 32,
+            "X-Honcho-Stage": "deriver",
+            "X-Honcho-Call-Purpose": "deriver.representation",
+        }
+        with patch.dict("os.environ", {"HERMES_HOME": str(self.home)}):
+            first = proxy.route_begin(
+                "caller", "/v1/chat/completions", "model", headers
+            )
+            second = proxy.route_begin(
+                "caller", "/v1/chat/completions", "model", headers
+            )
+            proxy.route_finish(first, 429, "HTTPError")
+            proxy.route_finish(second, 200)
+        self.assertNotEqual(first, second)
+        with sqlite3.connect(self.path.parent / "routes.sqlite3") as c:
+            self.assertEqual(
+                c.execute(
+                    "SELECT count(*),count(DISTINCT request_id) FROM correlations"
+                ).fetchone(),
+                (2, 1),
+            )
+
+    def test_bad_or_inconsistent_stage_headers_remain_unattributed(self):
+        for headers in (
+            {"X-Honcho-Request-ID": "SECRET", "X-Honcho-Stage": "deriver"},
+            {
+                "X-Honcho-Request-ID": "a" * 32,
+                "X-Honcho-Stage": "deriver",
+                "X-Honcho-Call-Purpose": "summary.short",
+            },
+            {"X-Honcho-Request-ID": "a" * 32, "X-Honcho-Stage": "embedding"},
+        ):
+            self.assertEqual(
+                proxy.correlation_fields(headers, "chat")[1], "unattributed"
+            )
+
+    def test_legacy_receipts_never_acquire_inferred_stage_labels(self):
+        with patch.dict("os.environ", {"HERMES_HOME": str(self.home)}):
+            row = proxy.route_begin("caller", "/v1/chat/completions", "glm-model")
+            proxy.route_finish(row, 200)
+        with sqlite3.connect(self.path.parent / "routes.sqlite3") as c:
+            c.execute("DROP TABLE correlations")
+        result = routing_receipts(self.home)
+        self.assertEqual(result["unattributed"], 1)
+        self.assertEqual(set(result["stage_coverage"].values()), {"not_observed"})
+
+    def test_bounded_retention_removes_only_corresponding_completed_children(self):
+        with patch.dict("os.environ", {"HERMES_HOME": str(self.home)}):
+            with proxy.receipt_db() as c:
+                old = time.time() - 8 * 86400
+                c.executemany(
+                    "INSERT INTO routes VALUES(?,?,?,?,?,?,?,?,?)",
+                    [
+                        (
+                            f"old{i}",
+                            old,
+                            old,
+                            "caller",
+                            "chat",
+                            "model",
+                            "endpoint",
+                            200,
+                            None,
+                        )
+                        for i in range(501)
+                    ],
+                )
+                c.executemany(
+                    "INSERT INTO correlations VALUES(?,?,?,?)",
+                    [(f"old{i}", None, "unattributed", None) for i in range(501)],
+                )
+            proxy.route_begin("caller", "/v1/chat/completions", "model")
+        with sqlite3.connect(self.path.parent / "routes.sqlite3") as c:
+            self.assertEqual(c.execute("SELECT count(*) FROM routes").fetchone()[0], 2)
+            self.assertEqual(
+                c.execute("SELECT count(*) FROM correlations").fetchone()[0], 2
+            )
+
 
 class ConfigReceiptTests(unittest.TestCase):
     def test_mismatched_container_routes_are_not_healthy(self):

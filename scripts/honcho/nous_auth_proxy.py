@@ -103,6 +103,33 @@ def live_token():
             raise
 
 
+PURPOSE_STAGES = {
+    "deriver.representation": "deriver",
+    "dialectic.answer": "dialectic",
+    "dream.deduction": "dream",
+    "dream.induction": "dream",
+    "summary.short": "summary",
+    "summary.long": "summary",
+}
+
+
+def correlation_fields(headers, operation):
+    ident = headers.get("X-Honcho-Request-ID")
+    stage = headers.get("X-Honcho-Stage")
+    purpose = headers.get("X-Honcho-Call-Purpose")
+    if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{32}", ident):
+        return None, "unattributed", None
+    if stage == "embedding" and not purpose and operation == "embedding":
+        return ident, stage, None
+    if (
+        operation == "chat"
+        and isinstance(purpose, str)
+        and PURPOSE_STAGES.get(purpose) == stage
+    ):
+        return ident, stage, purpose
+    return ident, "unattributed", None
+
+
 @contextmanager
 def receipt_db():
     home = Path(os.environ.get("HERMES_HOME", "/home/ubuntu/.hermes"))
@@ -123,13 +150,19 @@ def receipt_db():
         )
         c.execute("CREATE INDEX IF NOT EXISTS routes_finished ON routes(finished)")
         c.execute("CREATE INDEX IF NOT EXISTS routes_started ON routes(started)")
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS correlations (route_id TEXT PRIMARY KEY, request_id TEXT, stage TEXT NOT NULL, purpose TEXT)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS correlation_request ON correlations(request_id)"
+        )
         with c:
             yield c
     finally:
         c.close()
 
 
-def route_begin(caller, path, model):
+def route_begin(caller, path, model, headers=None):
     ident = uuid.uuid4().hex
     operation = {"/v1/embeddings": "embedding", "/v1/chat/completions": "chat"}.get(
         urlsplit(path).path, "other"
@@ -152,10 +185,17 @@ def route_begin(caller, path, model):
                 u.scheme + "://" + (u.hostname or ""),
             ),
         )
+        request_id, stage, purpose = correlation_fields(headers or {}, operation)
         c.execute(
-            "DELETE FROM routes WHERE rowid IN (SELECT rowid FROM routes WHERE finished < ? LIMIT 500)",
-            (time.time() - 7 * 86400,),
+            "INSERT INTO correlations VALUES(?,?,?,?)",
+            (ident, request_id, stage, purpose),
         )
+        old = c.execute(
+            "SELECT id FROM routes WHERE finished < ? ORDER BY finished LIMIT 500",
+            (time.time() - 7 * 86400,),
+        ).fetchall()
+        c.executemany("DELETE FROM correlations WHERE route_id=?", old)
+        c.executemany("DELETE FROM routes WHERE id=?", old)
     return ident
 
 
@@ -339,7 +379,9 @@ class H(BaseHTTPRequestHandler):
             except (ValueError, AttributeError, TypeError):
                 pass
             try:
-                receipt = route_begin(self.client_address[0], self.path, model)
+                receipt = route_begin(
+                    self.client_address[0], self.path, model, headers=self.headers
+                )
                 self.route_receipt = receipt
             except Exception:
                 sys.stderr.write("route receipt admission unavailable\n")

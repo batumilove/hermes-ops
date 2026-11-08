@@ -132,7 +132,7 @@ def routing_receipts(home, *, now=None, path=None, caller=None):
     now = time.time() if now is None else now
     result = {
         "status": "unverified",
-        "scope": "proxy-bound HTTP attempts; requested model, not per-stage coverage",
+        "scope": "proxy-bound attempts; stage from validated caller headers; requested model",
     }
     try:
         store = (
@@ -140,20 +140,40 @@ def routing_receipts(home, *, now=None, path=None, caller=None):
         )
         with _read(store) as c:
             c.row_factory = sqlite3.Row
-            condition = " AND caller=?" if caller else ""
+            correlated = (
+                c.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='correlations'"
+                ).fetchone()
+                is not None
+            )
+            relation = (
+                "routes AS r LEFT JOIN correlations AS c ON c.route_id=r.id"
+                if correlated
+                else "routes AS r"
+            )
+            fields = (
+                "r.*,COALESCE(c.stage,'unattributed') AS stage,c.request_id"
+                if correlated
+                else "r.*,'unattributed' AS stage,NULL AS request_id"
+            )
+            condition = " AND r.caller=?" if caller else ""
             params = (now - 900, caller) if caller else (now - 900,)
             rows = [
                 dict(r)
                 for r in c.execute(
-                    "SELECT * FROM routes WHERE (started>=? OR finished IS NULL)"
+                    "SELECT "
+                    + fields
+                    + " FROM "
+                    + relation
+                    + " WHERE (r.started>=? OR r.finished IS NULL)"
                     + condition
-                    + " ORDER BY started DESC LIMIT 1001",
+                    + " ORDER BY r.started DESC LIMIT 1001",
                     params,
                 )
             ]
             old_params = (now - 150, caller) if caller else (now - 150,)
             overdue = c.execute(
-                "SELECT EXISTS(SELECT 1 FROM routes WHERE finished IS NULL AND started<?"
+                "SELECT EXISTS(SELECT 1 FROM routes AS r WHERE r.finished IS NULL AND r.started<?"
                 + condition
                 + ")",
                 old_params,
@@ -168,13 +188,15 @@ def routing_receipts(home, *, now=None, path=None, caller=None):
         }
     if not rows:
         return {**result, "status": "idle", "reason": "no_recent_proxy_attempts"}
-    failures = sum(
-        r["finished"] is not None
-        and (bool(r["error_class"]) or not r["status"] or r["status"] >= 400)
-        for r in rows
-    )
-    delayed = sum(r["finished"] is None and now - r["started"] > 150 for r in rows)
-    pending = sum(r["finished"] is None for r in rows)
+
+    def failed(r):
+        return r["finished"] is not None and (
+            bool(r["error_class"]) or not r["status"] or r["status"] >= 400
+        )
+
+    def delayed(r):
+        return r["finished"] is None and now - r["started"] > 150
+
     completed = [
         r
         for r in rows
@@ -183,23 +205,46 @@ def routing_receipts(home, *, now=None, path=None, caller=None):
         and 200 <= r["status"] < 400
         and not r["error_class"]
     ]
+    completed_ids = {r["id"] for r in completed}
+    coverage = {}
+    for stage in ("embedding", "deriver", "dialectic", "summary", "dream"):
+        selected = [r for r in rows if r["stage"] == stage]
+        coverage[stage] = (
+            "failed"
+            if any(failed(r) for r in selected)
+            else "delayed"
+            if any(delayed(r) for r in selected)
+            else "observed"
+            if any(r["id"] in completed_ids for r in selected)
+            else "pending"
+            if selected
+            else "not_observed"
+        )
+    failures = sum(failed(r) for r in rows)
+    late = sum(delayed(r) for r in rows)
     return {
         **result,
         "status": "failed"
         if failures
         else "delayed"
-        if delayed
+        if late
         else "observed"
         if completed
         else "pending",
+        "request_ids": sorted({r["request_id"] for r in rows if r["request_id"]}),
         "successful": len(completed),
         "failed": failures,
-        "delayed": delayed,
-        "pending": pending,
+        "delayed": late,
+        "pending": sum(r["finished"] is None for r in rows),
+        "unattributed": sum(r["stage"] == "unattributed" for r in rows),
+        "stage_coverage": coverage,
         "routes": [
-            dict(operation=r[0], model=r[1], endpoint=r[2])
+            dict(operation=r[0], model=r[1], endpoint=r[2], stage=r[3])
             for r in sorted(
-                {(r["operation"], r["model"], r["endpoint"]) for r in completed}
+                {
+                    (r["operation"], r["model"], r["endpoint"], r["stage"])
+                    for r in completed
+                }
             )
         ],
     }
@@ -229,3 +274,68 @@ def config_receipts(ssh_fn):
         "scope": "deployed parser; selected environment fixture; file sources absent",
         "containers": receipts,
     }
+
+
+def caller_receipts(ssh_fn, proxy, *, now=None):
+    """Caller errors remain visible even when the proxy received no request."""
+    import shlex
+
+    now = time.time() if now is None else now
+    result = {
+        "status": "unverified",
+        "scope": "instrumented OpenAI caller boundary; sampled proxy correlation",
+    }
+    try:
+        code = Path(__file__).with_name("caller_receipt_probe.py").read_text()
+        stores = json.loads(ssh_fn("python3 -I -B -c " + shlex.quote(code), timeout=15))
+        if not isinstance(stores, dict) or set(stores) != {"api", "deriver"}:
+            raise ValueError()
+        rows = []
+        unavailable = []
+        truncated = False
+        overdue = False
+        for name, store in stores.items():
+            if store.get("unavailable"):
+                unavailable.append(name)
+                continue
+            items = store["rows"]
+            if not isinstance(items, list) or len(items) > 1000:
+                raise ValueError()
+            rows.extend(items)
+            truncated |= bool(store.get("truncated"))
+            overdue |= bool(store.get("overdue"))
+        failures = sum(r["outcome"] in {"error", "cancelled"} for r in rows)
+        pending = sum(r["finished"] is None for r in rows)
+        late = sum(r["finished"] is None and now - r["started"] > 150 for r in rows)
+        success = sum(r["outcome"] == "success" for r in rows)
+        ids = set(proxy.get("request_ids", []))
+        # A successful caller may bypass this proxy; lack of a join is evidence
+        # uncertainty, not an invented provider failure. SDK retries may join many.
+        matched = sum(r["id"] in ids for r in rows)
+        status = (
+            "failed"
+            if failures
+            else "delayed"
+            if late or overdue
+            else "unverified"
+            if unavailable or truncated
+            else "pending"
+            if pending
+            else "observed"
+            if rows
+            else "idle"
+        )
+        return {
+            **result,
+            "status": status,
+            "failed": failures,
+            "successful": success,
+            "pending": pending,
+            "delayed": late,
+            "proxy_matched": matched,
+            "proxy_unmatched": len(rows) - matched,
+            "unavailable_stores": unavailable,
+            "truncated": truncated,
+        }
+    except (TypeError, ValueError, KeyError, OSError):
+        return {**result, "reason": "caller_probe_unavailable"}

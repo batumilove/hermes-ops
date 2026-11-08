@@ -128,3 +128,26 @@ another profile's store or treats an unavailable file as successful verification
 Unfinished attempts remain debt outside the recent activity window. Part reads,
 route reads and completed-receipt retention batches are bounded; receipt indexes
 keep admissions from repeatedly scanning the full history.
+
+### Exact stage attribution
+
+A compatible Honcho server emits an opaque `X-Honcho-Request-ID` and closed
+`X-Honcho-Stage`/`X-Honcho-Call-Purpose` headers at the actual SDK send boundary.
+The proxy accepts only the known stage/purpose taxonomy and consistent operation
+(embedding versus chat), and stores these fields in a separate correlation table.
+The original routes schema remains compatible with older readers/writers.
+Application request IDs survive SDK retries; each HTTP attempt retains its own
+unique receipt ID and outcome. No stage is guessed from a model name or timestamp.
+The monitor reports sampled stage outcomes and `not_observed` for absent stages;
+untagged legacy calls stay explicitly unattributed. These are sampled execution
+receipts, not a claim of transcript-wide completeness or output semantics.
+
+The server can also persist private caller receipts before provider dispatch,
+using `HONCHO_REQUEST_RECEIPT_PATH`. On the Honcho host, persist the API and
+deriver stores separately as `/var/lib/honcho-receipts/api.sqlite3` and
+`deriver.sqlite3`, mounted privately into their respective containers. The SSH
+collector reads at most 1000 recent or unfinished requests per store, including
+old unfinished debt. Caller errors and cancellations alert even if the proxy is
+unreachable. Opaque request IDs join caller and proxy attempts; an unmatched
+success remains explicitly unmatched rather than being classified as an outage.
+A missing store or truncated window cannot establish idle or complete coverage.
