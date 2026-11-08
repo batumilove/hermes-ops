@@ -94,3 +94,17 @@ def test_truncation_keeps_debt_status():
         caller_receipts(lambda *a, **k: json.dumps(data), {}, now=1000)["status"]
         == "delayed"
     )
+
+
+def test_collector_uses_actual_container_identity():
+    commands = []
+
+    def ssh(command, **kwargs):
+        commands.append(command)
+        return json.dumps(stores([]))
+
+    assert caller_receipts(ssh, {}, now=1000)["status"] == "idle"
+    assert commands[0].startswith(
+        "docker exec honcho-api-1 /app/.venv/bin/python -I -B -c "
+    )
+    assert "mode=ro" in commands[0]
