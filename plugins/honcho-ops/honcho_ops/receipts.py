@@ -38,16 +38,20 @@ def ingestion_receipts(home, ssh_fn, *, now=None, limit=120):
             ]
             if len(rows) > limit:
                 return {**result, "reason": "receipt_window_truncated"}
-            parts = {
-                r["id"]: [
+            parts = {}
+            remaining = 2400
+            for row in rows:
+                ps = [
                     dict(p)
                     for p in c.execute(
-                        "SELECT ordinal,role,remote_id FROM parts WHERE turn_id=? ORDER BY ordinal",
-                        (r["id"],),
+                        "SELECT ordinal,role,remote_id FROM parts WHERE turn_id=? ORDER BY ordinal LIMIT ?",
+                        (row["id"], remaining + 1),
                     )
                 ]
-                for r in rows
-            }
+                if len(ps) > remaining:
+                    return {**result, "reason": "receipt_part_window_truncated"}
+                parts[row["id"]] = ps
+                remaining -= len(ps)
     except (sqlite3.Error, OSError, ValueError):
         return {**result, "reason": "receipt_store_unavailable"}
     if not rows:
@@ -124,26 +128,44 @@ def ingestion_receipts(home, ssh_fn, *, now=None, limit=120):
     return {**result, "status": status, "reason": "scoped_receipts_only"}
 
 
-def routing_receipts(home, *, now=None):
+def routing_receipts(home, *, now=None, path=None, caller=None):
     now = time.time() if now is None else now
     result = {
         "status": "unverified",
         "scope": "proxy-bound HTTP attempts; requested model, not per-stage coverage",
     }
     try:
-        with _read(Path(home) / "cache/honcho-receipts/routes.sqlite3") as c:
+        store = (
+            Path(path) if path else Path(home) / "cache/honcho-receipts/routes.sqlite3"
+        )
+        with _read(store) as c:
             c.row_factory = sqlite3.Row
+            condition = " AND caller=?" if caller else ""
+            params = (now - 900, caller) if caller else (now - 900,)
             rows = [
                 dict(r)
                 for r in c.execute(
-                    "SELECT * FROM routes WHERE started>=? ORDER BY started DESC LIMIT 1001",
-                    (now - 900,),
+                    "SELECT * FROM routes WHERE (started>=? OR finished IS NULL)"
+                    + condition
+                    + " ORDER BY started DESC LIMIT 1001",
+                    params,
                 )
             ]
+            old_params = (now - 150, caller) if caller else (now - 150,)
+            overdue = c.execute(
+                "SELECT EXISTS(SELECT 1 FROM routes WHERE finished IS NULL AND started<?"
+                + condition
+                + ")",
+                old_params,
+            ).fetchone()[0]
     except (sqlite3.Error, OSError, ValueError):
         return {**result, "reason": "route_store_unavailable"}
     if len(rows) > 1000:
-        return {**result, "reason": "route_window_truncated"}
+        return {
+            **result,
+            "status": "delayed" if overdue else "unverified",
+            "reason": "route_window_truncated",
+        }
     if not rows:
         return {**result, "status": "idle", "reason": "no_recent_proxy_attempts"}
     failures = sum(

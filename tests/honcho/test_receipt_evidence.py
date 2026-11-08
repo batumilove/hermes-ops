@@ -4,7 +4,11 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,6 +25,12 @@ spec.loader.exec_module(proxy)
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):
+        block = patch(
+            "socket.socket.connect",
+            side_effect=AssertionError("provider network forbidden"),
+        )
+        block.start()
+        self.addCleanup(block.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
@@ -130,17 +140,19 @@ class EvidenceTests(unittest.TestCase):
     def test_handler_failure_is_recorded_without_exception_text(self):
         h = object.__new__(proxy.H)
         h.path = "/v1/chat/completions"
-        h.headers = {"Content-Length": "37"}
-        h.rfile = io.BytesIO(b'{"model":"m","messages":["private"]}')
-        h.client_address = ("client", 1)
+        body = b'{"model":"m","messages":["private"]}'
+        h.headers = {"Content-Length": str(len(body))}
+        h.rfile = io.BytesIO(body)
+        h.connection = SimpleNamespace(settimeout=lambda seconds: None)
+        h.client_address = ("127.0.0.1", 1)
         replies = []
         h._reply = lambda code, body, *args: replies.append((code, body))
         with (
             patch.dict("os.environ", {"HERMES_HOME": str(self.home)}),
             patch.object(proxy, "live_token", return_value="fake"),
             patch.object(
-                proxy.urllib.request,
-                "urlopen",
+                proxy,
+                "open_upstream",
                 side_effect=TimeoutError("private token"),
             ),
         ):
@@ -148,6 +160,164 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(replies[-1][0], 502)
         self.assertNotIn("private", str(replies))
         self.assertEqual(routing_receipts(self.home)["status"], "failed")
+
+    def test_unfinished_request_does_not_disappear_after_recent_window(self):
+        with patch.dict("os.environ", {"HERMES_HOME": str(self.home)}):
+            old = proxy.route_begin("client", "/v1/chat/completions", "model")
+            new = proxy.route_begin("client", "/v1/embeddings", "embedding")
+            proxy.route_finish(new, 200)
+        with sqlite3.connect(self.path.parent / "routes.sqlite3") as c:
+            c.execute(
+                "UPDATE routes SET started=? WHERE id=?", (time.time() - 4000, old)
+            )
+            indexes = {r[1] for r in c.execute("PRAGMA index_list(routes)")}
+        self.assertTrue({"routes_finished", "routes_started"} <= indexes)
+        result = routing_receipts(self.home)
+        self.assertEqual((result["status"], result["delayed"]), ("delayed", 1))
+
+    def test_explicit_proxy_path_is_independent_of_monitor_profile(self):
+        with patch.dict("os.environ", {"HERMES_HOME": str(self.home)}):
+            row = proxy.route_begin("intended", "/v1/embeddings", "embedding")
+            proxy.route_finish(row, 200)
+        other = self.home / "other-profile"
+        self.assertEqual(routing_receipts(other)["status"], "unverified")
+        store = self.path.parent / "routes.sqlite3"
+        self.assertEqual(
+            routing_receipts(other, path=store, caller="intended")["status"], "observed"
+        )
+        self.assertEqual(
+            routing_receipts(other, path=store, caller="foreign")["status"], "idle"
+        )
+
+    def test_many_parts_are_bounded_before_remote_query(self):
+        self.seed()
+        with sqlite3.connect(self.path) as c:
+            c.executemany(
+                "INSERT INTO parts VALUES(?,?,?,?)",
+                [("turn", i, "user", str(i)) for i in range(1, 3000)],
+            )
+        result = ingestion_receipts(
+            self.home, lambda *a, **k: self.fail("no oversized remote query"), now=1000
+        )
+        self.assertEqual(result["reason"], "receipt_part_window_truncated")
+
+    def handler(self, body=b"{}", address="127.0.0.1"):
+        h = object.__new__(proxy.H)
+        h.path = "/v1/chat/completions"
+        h.headers = {"Content-Length": str(len(body))}
+        h.rfile = io.BytesIO(body)
+        h.connection = SimpleNamespace(settimeout=lambda seconds: None)
+        h.client_address = (address, 1)
+        h.replies = []
+        h._reply = lambda code, data, *args: h.replies.append((code, data))
+        return h
+
+    def test_unauthorized_caller_never_loads_token_or_uses_upstream(self):
+        h = self.handler(address="198.51.100.2")
+        with (
+            patch.object(
+                proxy, "live_token", side_effect=AssertionError("token read forbidden")
+            ),
+            patch.object(
+                proxy, "open_upstream", side_effect=AssertionError("upstream forbidden")
+            ),
+        ):
+            h.do_POST()
+            h.do_GET()
+        self.assertTrue(all(r[0] == 403 for r in h.replies))
+        with patch.dict("os.environ", {"NOUS_PROXY_ALLOWLIST": "192.0.2.2/32"}):
+            self.assertTrue(proxy.allowed_caller("192.0.2.2"))
+            self.assertFalse(proxy.allowed_caller("192.0.2.3"))
+
+    def test_invalid_or_excessive_body_lengths_are_rejected(self):
+        for length in ("-1", str(proxy.MAX_REQUEST_BYTES + 1), "invalid"):
+            h = self.handler()
+            h.headers["Content-Length"] = length
+            with patch.object(
+                proxy, "live_token", side_effect=AssertionError("token forbidden")
+            ):
+                h.do_POST()
+            self.assertIn(h.replies[0][0], (400, 413))
+            self.assertTrue(h.close_connection)
+
+    def test_incomplete_body_and_absolute_deadline_are_bounded(self):
+        h = self.handler(b"x")
+        h.headers["Content-Length"] = "2"
+        h.do_POST()
+        self.assertEqual(h.replies[0][0], 400)
+        h = self.handler(b"x")
+        with patch.object(proxy.time, "monotonic", side_effect=[0, 0, 21]):
+            h.do_POST()
+        self.assertEqual(h.replies[0][0], 408)
+
+    def test_connection_reuse_cannot_advertise_previous_receipt(self):
+        h = self.handler(b'{"model":"model"}')
+        h.route_receipt = "previous-request"
+        with (
+            patch.object(proxy, "route_begin", side_effect=OSError()),
+            patch.object(proxy, "live_token", return_value="fake"),
+            patch.object(proxy, "open_upstream", side_effect=TimeoutError()),
+        ):
+            h.do_POST()
+        self.assertIsNone(h.route_receipt)
+
+    def test_redirect_policy_keeps_bearer_on_trusted_origin(self):
+        policy = proxy.TrustedRedirect()
+        request = urllib.request.Request(
+            proxy.UPSTREAM + "/v1/models", headers={"Authorization": "Bearer FAKE"}
+        )
+        with self.assertRaises(urllib.error.URLError):
+            policy.redirect_request(
+                request, None, 302, "", {}, "https://foreign.invalid/receive"
+            )
+        same = policy.redirect_request(
+            request, None, 302, "", {}, proxy.UPSTREAM + "/v1/models-next"
+        )
+        self.assertEqual(same.get_header("Authorization"), "Bearer FAKE")
+
+    def test_streaming_flushes_before_reading_next_upstream_chunk(self):
+        events = []
+        chunks = iter([b"data: first\n\n", b"data: [DONE]\n\n", b""])
+
+        class Response:
+            headers = {"Content-Type": "text/event-stream"}
+
+            def read1(self, size):
+                events.append("read")
+                return next(chunks)
+
+            def read(self, *args):
+                raise AssertionError("must not buffer streaming response")
+
+        h = self.handler()
+        h.route_receipt = "receipt"
+        headers = []
+        h.send_response = lambda code: None
+        h.send_header = lambda k, v: headers.append((k, v))
+        h.end_headers = lambda: None
+        h.wfile = SimpleNamespace(
+            write=lambda data: events.append(data), flush=lambda: events.append("flush")
+        )
+        h._forward(Response(), 200, stream=True)
+        self.assertEqual(events[:4], ["read", b"data: first\n\n", "flush", "read"])
+        self.assertIn(("Content-Type", "text/event-stream"), headers)
+        self.assertTrue(h.close_connection)
+
+    def test_nonstreaming_and_http_error_bodies_preserve_content_type(self):
+        h = self.handler()
+        replies = []
+        h._reply = lambda code, body, ctype: replies.append((code, body, ctype))
+        error = urllib.error.HTTPError(
+            proxy.UPSTREAM,
+            400,
+            "Bad Request",
+            {"Content-Type": "application/problem+json"},
+            io.BytesIO(b'{"error":"invalid"}'),
+        )
+        h._forward(error, 400)
+        self.assertEqual(
+            replies, [(400, b'{"error":"invalid"}', "application/problem+json")]
+        )
 
 
 class ConfigReceiptTests(unittest.TestCase):

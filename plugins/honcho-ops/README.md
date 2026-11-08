@@ -110,3 +110,21 @@ supported gateway lifecycle command. Preserve receipt databases during code-only
 rollback. Verify a naturally admitted turn; never send synthetic conversation
 content to manufacture acceptance. The monitor's regular cron schedule and
 delivery destination remain unchanged.
+
+
+The proxy defaults to loopback binding and loopback callers. A remote Honcho
+installation must explicitly set `NOUS_PROXY_BIND` and `NOUS_PROXY_ALLOWLIST`
+(IP addresses/CIDRs); rejected sockets do not load the provider credential.
+Authenticated redirects are limited to the upstream origin. POST bodies have a
+size cap and absolute read deadline; streaming responses preserve SSE content type
+and flush incrementally. Receipt IDs reset per request on persistent connections.
+
+Set `NOUS_PROXY_RECEIPT_PATH` to the private authoritative SQLite file. When the
+monitor uses a different profile home, explicitly select that same accessible file
+with `HONCHO_MONITOR_PROXY_RECEIPTS`; `HONCHO_MONITOR_PROXY_CALLER` optionally
+restricts verification to the Honcho host's observed source IP. A remote store must
+be made accessible through an authorized collector/mount; this plugin never guesses
+another profile's store or treats an unavailable file as successful verification.
+Unfinished attempts remain debt outside the recent activity window. Part reads,
+route reads and completed-receipt retention batches are bounded; receipt indexes
+keep admissions from repeatedly scanning the full history.

@@ -964,22 +964,26 @@ def format_report(snapshot: dict[str, Any] | HonchoSnapshot, previous_state: dic
     config_receipt = (snapshot.ingestion or {}).get("config_receipts", {})
     if config_receipt.get("status") == "reconstructed":
         lines.append("  Inspected configuration: MATCHED (both deployed parsers, isolated route inputs; not process-memory proof)")
+    elif config_receipt.get("status") == "mismatch":
+        lines.append("  Inspected configuration: MISMATCH (API and deriver route fields differ)")
     else:
         lines.append("  Inspected configuration: UNKNOWN (fresh receipt not collected)")
     receipt = (snapshot.ingestion or {}).get("receipts", {})
     if receipt:
-        lines.append(f"  Writer receipts: {receipt.get('status', 'unverified')} · verified={receipt.get('verified', 0)} · pending={receipt.get('pending', 0)} · uncertain={receipt.get('uncertain', 0)} (admitted turns only)")
+        lines.append(f"  Writer receipts: {receipt.get('status', 'unverified')} · verified={receipt.get('verified', 0)} · pending={receipt.get('pending', '?')} · uncertain={receipt.get('uncertain', '?')} (admitted turns only)")
     route_receipt = (snapshot.ingestion or {}).get("routing_receipts", {})
     if route_receipt.get("status") in {"observed", "failed", "delayed", "pending"}:
-        lines.append(f"  Actual proxy routing: {route_receipt['status']} · successful={route_receipt.get('successful', 0)} · failed={route_receipt.get('failed', 0)} · pending={route_receipt.get('pending', 0)} (requested model; per-stage coverage unverified)")
+        lines.append(f"  Actual proxy routing: {route_receipt['status']} · successful={route_receipt.get('successful', '?')} · failed={route_receipt.get('failed', '?')} · pending={route_receipt.get('pending', '?')} (requested model; per-stage coverage unverified)")
         for route in route_receipt.get("routes", []):
             lines.append(f"    {route['operation']}: {route['model']} → {short_host(route['endpoint'])}")
     else:
         lines.append("  Actual request routing: UNKNOWN / UNVERIFIED (no natural dispatch receipt)")
     if service_alerts:
         lines.append(f"⚠️ {len(service_alerts)}: {'; '.join(service_alerts)}")
-    if route_receipt.get("status") == "observed":
-        lines.append("  Verification scope: proxy attempts observed; complete stage coverage and transcript-wide ingestion remain unverified")
+    if config_receipt.get("status") or route_receipt.get("status"):
+        config_label = config_receipt.get("status", "unknown")
+        route_label = route_receipt.get("status", "unverified")
+        lines.append(f"  Verification scope: configuration={config_label}; proxy attempts={route_label}; complete stage coverage and transcript-wide ingestion remain unverified")
     else:
         lines.append("⚠️ Verification advisory: configuration provenance UNKNOWN; actual traffic UNVERIFIED (not evidence of outage)")
 
@@ -1338,7 +1342,9 @@ def collect_snapshot() -> tuple[HonchoSnapshot, dict[str, Any]]:
     from hermes_constants import get_hermes_home
     from .receipts import ingestion_receipts, routing_receipts, config_receipts
     ingestion["receipts"] = ingestion_receipts(get_hermes_home(), ssh)
-    ingestion["routing_receipts"] = routing_receipts(get_hermes_home())
+    ingestion["routing_receipts"] = routing_receipts(
+        get_hermes_home(), path=os.environ.get("HONCHO_MONITOR_PROXY_RECEIPTS"),
+        caller=os.environ.get("HONCHO_MONITOR_PROXY_CALLER"))
     ingestion["config_receipts"] = config_receipts(ssh)
     if ingestion["config_receipts"].get("status") == "reconstructed":
         pipeline["_routing"] = {"status": "reconstructed", "reason": "both deployed parsers; isolated selected route inputs"}
