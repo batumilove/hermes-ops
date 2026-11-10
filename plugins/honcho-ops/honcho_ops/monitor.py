@@ -977,7 +977,9 @@ def format_report(snapshot: dict[str, Any] | HonchoSnapshot, previous_state: dic
     caller = (snapshot.ingestion or {}).get("caller_receipts", {})
     lines.append(f"  Caller receipts: {caller.get('status', 'unverified')} · failed={caller.get('failed', '?')} · pending={caller.get('pending', '?')} · proxy matched={caller.get('proxy_matched', '?')} · unmatched={caller.get('proxy_unmatched', '?')}")
     route_receipt = (snapshot.ingestion or {}).get("routing_receipts", {})
-    if route_receipt.get("status") in {"observed", "failed", "delayed", "pending"}:
+    if route_receipt.get('recovered_attempts'):
+        lines.append(f"  Recovered proxy attempts: {route_receipt['recovered_attempts']} · exact caller retry succeeded (advisory)")
+    if route_receipt.get("status") in {"observed", "failed", "delayed", "pending", "recovered"}:
         lines.append(f"  Actual proxy routing: {route_receipt['status']} · successful={route_receipt.get('successful', '?')} · failed={route_receipt.get('failed', '?')} · pending={route_receipt.get('pending', '?')} (requested model; stage attribution is sampled)")
         for route in route_receipt.get("routes", []):
             stage = route.get("stage", "unattributed")
@@ -1437,7 +1439,10 @@ def collect_snapshot() -> tuple[HonchoSnapshot, dict[str, Any]]:
         "count(*) FILTER (WHERE work_unit_key LIKE 'dream:%')::text, "
         "COALESCE(EXTRACT(EPOCH FROM (now() - min(last_updated) FILTER (WHERE work_unit_key LIKE 'dream:%')))::int::text, '0'), "
         "count(*) FILTER (WHERE work_unit_key NOT LIKE 'representation:%' AND work_unit_key NOT LIKE 'dream:%')::text, "
-        "COALESCE(EXTRACT(EPOCH FROM (now() - min(last_updated) FILTER (WHERE work_unit_key NOT LIKE 'representation:%' AND work_unit_key NOT LIKE 'dream:%')))::int::text, '0') "
+        "COALESCE(EXTRACT(EPOCH FROM (now() - min(last_updated) FILTER (WHERE work_unit_key NOT LIKE 'representation:%' AND work_unit_key NOT LIKE 'dream:%')))::int::text, '0'), "
+        "COALESCE((SELECT work_unit_key FROM active_queue_sessions WHERE work_unit_key LIKE 'representation:%' ORDER BY last_updated LIMIT 1), ''), "
+        "COALESCE((SELECT work_unit_key FROM active_queue_sessions WHERE work_unit_key LIKE 'dream:%' ORDER BY last_updated LIMIT 1), ''), "
+        "COALESCE((SELECT work_unit_key FROM active_queue_sessions WHERE work_unit_key NOT LIKE 'representation:%' AND work_unit_key NOT LIKE 'dream:%' ORDER BY last_updated LIMIT 1), '') "
         "FROM active_queue_sessions;\"",
         timeout=20,
     )
@@ -1476,6 +1481,9 @@ def collect_snapshot() -> tuple[HonchoSnapshot, dict[str, Any]]:
             "active_count": active_count,
             "active_oldest_age_s": active_oldest_age_s,
             "active_oldest_work_unit_key": active_oldest_work_unit_key,
+            "active_other_oldest_work_unit_key": active_parts[11] if len(active_parts) > 11 else "",
+            "active_dream_oldest_work_unit_key": active_parts[10] if len(active_parts) > 10 else "",
+            "active_representation_oldest_work_unit_key": active_parts[9] if len(active_parts) > 9 else "",
             "active_representation_count": active_representation_count,
             "active_representation_oldest_age_s": active_representation_oldest_age_s,
             "active_dream_count": active_dream_count,
@@ -1503,6 +1511,9 @@ def collect_snapshot() -> tuple[HonchoSnapshot, dict[str, Any]]:
             "active_count": active_count,
             "active_oldest_age_s": active_oldest_age_s,
             "active_oldest_work_unit_key": active_oldest_work_unit_key,
+            "active_other_oldest_work_unit_key": active_parts[11] if len(active_parts) > 11 else "",
+            "active_dream_oldest_work_unit_key": active_parts[10] if len(active_parts) > 10 else "",
+            "active_representation_oldest_work_unit_key": active_parts[9] if len(active_parts) > 9 else "",
             "active_representation_count": active_representation_count,
             "active_representation_oldest_age_s": active_representation_oldest_age_s,
             "active_dream_count": active_dream_count,
@@ -1531,6 +1542,55 @@ def should_emit_report(snapshot: HonchoSnapshot, previous_state: dict[str, Any] 
     return bool(build_alerts(snapshot, previous_state=previous_state))
 
 
+def notification_fingerprint(snapshot, previous_state):
+    """Finite typed semantic state; normalize only known volatile age displays."""
+    import hashlib
+    import json
+    import re
+    alerts = build_alerts(snapshot, previous_state=previous_state)
+    if not alerts:
+        return None
+    stable_alerts = []
+    for alert in alerts:
+        if re.fullmatch(r"(?:Representation|Dream|Other|Deriver) active work stale \(.*\)", alert):
+            alert = re.sub(r", oldest [^)]+\)$", ", oldest <age>)", alert)
+        elif alert.startswith("Hermes→Honcho ingestion stale ("):
+            alert = "Hermes→Honcho ingestion stale"
+        elif alert.startswith("Honcho SSH probe failed ("):
+            alert = re.sub(r"\(\d+ consecutive\)", "(<count> consecutive)", alert)
+        stable_alerts.append(alert)
+    identities = {}
+    for name in ('routing_receipts', 'caller_receipts', 'receipts'):
+        receipt = (snapshot.ingestion or {}).get(name, {})
+        if receipt.get('status') in {'failed', 'delayed', 'unknown'}:
+            identities[name] = sorted(receipt.get('fault_ids', receipt.get('request_ids', [])))
+    deriver = snapshot.deriver or {}
+    work = {key: deriver.get(key) for key in (
+        'active_oldest_work_unit_key', 'active_representation_oldest_work_unit_key',
+        'active_dream_oldest_work_unit_key', 'active_other_oldest_work_unit_key')}
+    buckets = {}
+    for key in ('active_oldest_age_s', 'active_representation_oldest_age_s',
+                'active_dream_oldest_age_s', 'active_other_oldest_age_s'):
+        value = deriver.get(key)
+        if isinstance(value, (float, int)) and value > 300:
+            buckets[key] = int(value // 300).bit_length()
+    canonical = {
+        'schema': 2, 'alerts': sorted(stable_alerts), 'receipts': identities,
+        'stale_work': work if any('active work stale' in a for a in alerts) else {},
+        'stall_buckets': buckets,
+        'embedding': {key: snapshot.pipeline.get('embedding', {}).get(key)
+                      for key in ('model', 'base_url', 'vector_dimensions')}
+                     if any('Embedding' in a or 'embedding' in a for a in alerts) else {},
+        'dimensions': {key: snapshot.db.get(key) for key in ('documents_dims', 'messages_dims')}
+                      if any('dims mismatch' in a for a in alerts) else {},
+        'errors': {key: snapshot.errors.get(key) for key in ('save_representation', 'four_oh_one')}
+                  if 'Recent representation save / 401 errors' in alerts else {},
+        'config_mismatch': (snapshot.ingestion or {}).get('config_receipts', {})
+                           if 'Honcho API/deriver route configuration mismatch' in alerts else {},
+    }
+    return hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+
+
 def main() -> int:
     snapshot, current_state = collect_snapshot()
     previous_state = load_state(_state_path())
@@ -1539,9 +1599,20 @@ def main() -> int:
         snapshot, previous_state
     )
     report_snapshot = restore_last_valid_remote_sample(snapshot, previous_state)
-    if should_emit_report(report_snapshot, previous_state=previous_state):
+    fingerprint = notification_fingerprint(report_snapshot, previous_state)
+    old_notice = previous_state.get('notification', {})
+    now = time.time()
+    reminder = _monitor_int('REMINDER_SECONDS', 14400)
+    changed = fingerprint != old_notice.get('fingerprint')
+    emit = should_emit_report(report_snapshot, previous_state=previous_state)
+    always = os.environ.get('HONCHO_MONITOR_ALWAYS_PRINT', '').strip().lower() in {'1', 'true', 'yes'}
+    emit = always or (emit and (changed or now - old_notice.get('emitted_at', 0) >= reminder))
+    recovery = not fingerprint and bool(old_notice.get('fingerprint'))
+    if emit or recovery:
         report = format_report(report_snapshot, previous_state=previous_state)
-        print(report)
+        print(('ℹ️ Honcho prior alert conditions no longer observed; unknown boundaries remain unverified\n' if recovery else '') + report)
+    current_state['notification'] = {'fingerprint': fingerprint,
+        'emitted_at': now if emit or recovery else old_notice.get('emitted_at', 0)}
     if snapshot.services.get("ssh_ok") is False:
         current_state["ssh_failure_streak"] = int(previous_state.get("ssh_failure_streak", 0)) + 1
         for key in ("pipeline", "db", "queue", "queue_by_type", "errors", "deriver"):
