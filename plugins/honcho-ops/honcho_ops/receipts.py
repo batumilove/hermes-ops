@@ -231,6 +231,7 @@ def routing_receipts(home, *, now=None, path=None, caller=None):
         else "observed"
         if completed
         else "pending",
+        "_unfinished": [dict(request_id=r["request_id"], started=r["started"], stage=r["stage"], delayed=delayed(r)) for r in rows if r["finished"] is None],
         "request_ids": sorted({r["request_id"] for r in rows if r["request_id"]}),
         "successful": len(completed),
         "failed": failures,
@@ -248,6 +249,49 @@ def routing_receipts(home, *, now=None, path=None, caller=None):
             )
         ],
     }
+
+
+def reconcile_proxy_terminals(proxy, caller):
+    """Caller termination disproves ongoing work, never proves proxy success.
+
+    UUID identity plus stage and start-time proximity bind the same attempt.
+    There is no TTL-based expiry: absent/ambiguous evidence remains delayed.
+    """
+    result = dict(proxy)
+    unfinished = result.pop('_unfinished', [])
+    terminals = caller.get('_terminals', [])
+    collisions = set(caller.get('_collisions', []))
+    evidence_incomplete = caller.get('truncated') or caller.get('unavailable_stores')
+    reconciled = []
+    remaining = []
+    for route in unfinished:
+        same_id = [r for r in terminals if r.get('id') == route.get('request_id')]
+        matches = [r for r in same_id if
+                   not evidence_incomplete and route.get('request_id') not in collisions
+                   and len(same_id) == 1 and
+                   r.get('id') == route.get('request_id') and route.get('request_id')
+                   and r.get('stage') == route.get('stage')
+                   and isinstance(r.get('started'), (int, float))
+                   and 0 <= route['started'] - r['started'] <= 5
+                   and isinstance(r.get('finished'), (int, float))
+                   and route['started'] <= r['finished'] < float('inf')
+                   and r.get('outcome') in {'success', 'error', 'cancelled'}]
+        (reconciled if len(matches) == 1 else remaining).append(route)
+    result['historical_terminal_missing'] = len(reconciled)
+    if not reconciled:
+        return result
+    result['pending'] -= len(reconciled)
+    result['delayed'] -= sum(r['delayed'] for r in reconciled)
+    for stage in {r['stage'] for r in reconciled}:
+        if not any(r['stage'] == stage and r['delayed'] for r in remaining):
+            if result.get('stage_coverage', {}).get(stage) == 'delayed':
+                result['stage_coverage'] = dict(result['stage_coverage'])
+                result['stage_coverage'][stage] = 'historical_unknown'
+    result['status'] = ('failed' if result.get('failed') else
+                        'delayed' if result['delayed'] else
+                        'pending' if result['pending'] else
+                        'observed' if result.get('successful') else 'unverified')
+    return result
 
 
 def config_receipts(ssh_fn):
@@ -288,7 +332,8 @@ def caller_receipts(ssh_fn, proxy, *, now=None):
     try:
         code = (
             "import os; os.environ.clear()\n"
-            + Path(__file__).with_name("caller_receipt_probe.py").read_text()
+            + Path(__file__).with_name("caller_receipt_probe.py").read_text().replace(
+                "print(json.dumps(collect(),", "print(json.dumps(collect(lookup_ids=" + repr([r['request_id'] for r in proxy.get('_unfinished', []) if r.get('request_id')]) + "),")
         )
         stores = json.loads(
             ssh_fn(
@@ -303,16 +348,25 @@ def caller_receipts(ssh_fn, proxy, *, now=None):
         unavailable = []
         truncated = False
         overdue = False
+        collisions = set()
         for name, store in stores.items():
             if store.get("unavailable"):
                 unavailable.append(name)
                 continue
             items = store["rows"]
-            if not isinstance(items, list) or len(items) > 1000:
+            if not isinstance(items, list) or len(items) > 100:
                 raise ValueError()
             rows.extend(items)
+            collisions.update(store.get("collisions", []))
+            if len(rows) > 100:
+                raise ValueError()
             truncated |= bool(store.get("truncated"))
             overdue |= bool(store.get("overdue"))
+        from collections import Counter
+        collisions.update(rid for rid, count in Counter(r['id'] for r in rows).items() if count > 1)
+        terminals = list(rows)  # Include pending duplicates in ambiguity decisions.
+        # Historical lookup supplies liveness evidence only, not recent activity.
+        rows = [r for r in rows if r['started'] >= now - 900 or r['finished'] is None]
         failures = sum(r["outcome"] in {"error", "cancelled"} for r in rows)
         pending = sum(r["finished"] is None for r in rows)
         late = sum(r["finished"] is None and now - r["started"] > 150 for r in rows)
@@ -341,6 +395,8 @@ def caller_receipts(ssh_fn, proxy, *, now=None):
             "successful": success,
             "pending": pending,
             "delayed": late,
+            "_terminals": terminals,
+            "_collisions": sorted(collisions),
             "proxy_matched": matched,
             "proxy_unmatched": len(rows) - matched,
             "unavailable_stores": unavailable,
